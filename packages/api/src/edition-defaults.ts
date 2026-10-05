@@ -22,6 +22,10 @@ import { eeNewOrgPolicySeeder } from "./ee/services/new-org-policy-seeder";
 import { eePlatformLlm } from "./ee/services/platform-llm";
 import { onpremNewWorkspacePolicySeeder } from "./services/policy-onprem-seeder";
 import { pgAttachmentBlobStore } from "./services/attachments/pg-blob-store";
+import {
+  hasAttachmentBucketConfigured,
+  s3AttachmentBlobStore,
+} from "./ee/attachments/s3-blob-store";
 import { setDefaultAttachmentStore } from "./providers/attachment-store";
 import { isEntitled } from "./lib/entitlements";
 import { setDefaultCrypto } from "./providers/crypto";
@@ -72,7 +76,7 @@ let applied = false;
  * - `createApiApp` — every HTTP host (web /v1 catch-all, api-server, SCIM).
  * - the web app's eager server init (`lib/init/server.ts`) — server actions
  *   call the shared services directly without ever running `createApiApp`.
- * - standalone server scripts (`cloud-scripts/*`) that touch providers.
+ * - standalone server scripts that touch providers.
  *
  * A cloud read of an uninjected default FAILS LOUDLY (see
  * `providers/edition-state.ts`) — silently falling through to the onprem
@@ -83,14 +87,22 @@ export const ensureEditionDefaults = (): void => {
   if (applied) return;
   applied = true;
 
-  // Attachment BYTES (free feature — deliberately outside the ee/ block
-  // below): the inline-Postgres store serves both editions today. Like the
-  // policy seeder, both arms ride the DB client, so the impl is injected
-  // here rather than resolved as a static onprem default. Cloud's future
-  // scalable arm (S3) replaces this line behind config presence (bucket env
-  // set), never an edition branch — rows dispatch per `storageRef`, so mixed
-  // backends coexist.
-  setDefaultAttachmentStore(pgAttachmentBlobStore);
+  // Attachment BYTES. The seam and the inline-Postgres arm are FREE (a
+  // self-hoster runs them with no license); the object-storage arm is
+  // enterprise (`ee/attachments/s3-blob-store.ts`). Selected by config
+  // presence AND entitlement: `ATTACHMENTS_S3_BUCKET` set on an entitled
+  // deployment (cloud is always entitled; self-host via ENTERPRISE_ENABLED)
+  // sends NEW bytes to S3 and mints presigned downloads; otherwise Postgres.
+  // The env alone never flips it ("flag off ⇒ no EE behavior"). Rows
+  // dispatch per `storageRef`, so the two arms coexist with no migration —
+  // the S3 arm reads legacy inline rows through the pg arm. Both arms ride
+  // the DB client, so both are injected here rather than resolved as a
+  // static default (the providers barrel is client-reachable).
+  setDefaultAttachmentStore(
+    isEntitled() && hasAttachmentBucketConfigured()
+      ? s3AttachmentBlobStore
+      : pgAttachmentBlobStore,
+  );
 
   // Org-scoped OAuth interception and the org app-config tier are shared
   // features (both editions serve /org/apps + /org/connections), but their
@@ -143,9 +155,9 @@ export const ensureEditionDefaults = (): void => {
     // fails the boot.
     setDefaultPlatformLlm(eePlatformLlm);
 
-    // Cross-pod live transcript fan-out: api runs multiple pods, so the
+    // Cross-instance live transcript fan-out: with multiple api instances, the
     // in-process emitter delivers a publish to no one when the runner's event
-    // POST and a browser's SSE stream land on different pods. Redis pub/sub
+    // POST and a browser's SSE stream land on different instances. Redis pub/sub
     // carries every publish between them. The subscriber MUST be its own
     // connection: ioredis forbids commands on a connection in subscriber mode.
     //
@@ -153,7 +165,7 @@ export const ensureEditionDefaults = (): void => {
     // — unlike rate-limit/quota, which degrade at their call site — the cloud
     // arm MUST inject SOMETHING or the first getEventBus() throws. When Redis
     // is absent (dev/staging/a misconfigured cloud), inject the in-process
-    // emitter explicitly: it keeps a single-pod cloud correct and multi-pod
+    // emitter explicitly: it keeps a single instance correct and multiple
     // no worse than the pre-fix behavior, rather than 500ing every event.
     setDefaultEventBus(
       hasRedisConfigured()

@@ -112,6 +112,7 @@ beforeEach(() => {
     checkSandboxIds: async () => [],
     toolCall: async () => ({ ok: true, result: null }),
     memoryWrite: async () => ({ ok: true }),
+    uploadAttachment: async () => ({ ok: true, attachmentId: "att-fake" }),
     fetchAttachment: async () => Buffer.alloc(0),
   };
 
@@ -143,7 +144,7 @@ beforeEach(() => {
 });
 
 /**
- * `tick` only ENQUEUES since step 4 — the executor runs items on per-sandbox
+ * `tick` only ENQUEUES — the executor runs items on per-sandbox
  * chains. Driving a poll deterministically means ticking and then settling.
  */
 const drive = async (): Promise<void> => {
@@ -161,6 +162,23 @@ describe("start", () => {
     expect(record?.spec.homeRef).toBe("fake-home-sb-1");
     expect(record?.spec.image).toBe("onecli-agent:test");
     expect(record?.spec.limits).toEqual(config.limits);
+  });
+
+  it("wakes the home exactly once per start, handing it the payload's workspace (the placement a snapshot backend births a brand-new home from), on a first start and a recreate alike", async () => {
+    queued.push(startItem("sb-1", { workspaceId: "ws-1" }));
+    await drive();
+    expect(backend.wakes).toEqual([
+      { ref: "fake-home-sb-1", workspaceId: "ws-1" },
+    ]);
+
+    // A start of an EXISTING container recreates it (fresh token); the
+    // home is still woken first, once, with the same placement.
+    queued.push(startItem("sb-1", { workspaceId: "ws-1" }));
+    await drive();
+    expect(backend.wakes).toEqual([
+      { ref: "fake-home-sb-1", workspaceId: "ws-1" },
+      { ref: "fake-home-sb-1", workspaceId: "ws-1" },
+    ]);
   });
 
   it("delivers the CA file into the sandbox, never as a mount", async () => {
@@ -184,6 +202,32 @@ describe("start", () => {
       AGENT_INSTRUCTIONS: "Be useful.",
       AGENT_NAME: "Ada",
     });
+    // No presences composed → no variable (the supervisor reads absence as
+    // "none"); an older control plane that never sends the field looks the
+    // same.
+    expect(backend.sandboxes.get("sb-1")?.spec.env).not.toHaveProperty(
+      "AGENT_CHANNELS",
+    );
+  });
+
+  it("passes the agent's channel presences as JSON in AGENT_CHANNELS", async () => {
+    const channels = [
+      {
+        provider: "slack",
+        status: "active" as const,
+        handle: "ada",
+        workspaceName: "Acme",
+      },
+    ];
+    queued.push(startItem("sb-1", { channels }));
+    await drive();
+
+    const env = backend.sandboxes.get("sb-1")?.spec.env ?? {};
+    expect(JSON.parse(env.AGENT_CHANNELS ?? "null")).toEqual(channels);
+    // An empty list is a real value: "no presences", sent as such.
+    queued.push(startItem("sb-2", { channels: [] }));
+    await drive();
+    expect(backend.sandboxes.get("sb-2")?.spec.env.AGENT_CHANNELS).toBe("[]");
   });
 
   it("gives the sandbox a single-use control-channel token and its runner URL", async () => {
@@ -518,7 +562,7 @@ describe("a sandbox that is running but unreachable", () => {
 });
 
 describe("the vanished-pod arm (expected running, no snapshot)", () => {
-  // A pod deleted out-of-band (node death and its Kubernetes GC, an
+  // A sandbox deleted out-of-band (a host failure, an
   // eviction, a `docker rm`) leaves NO snapshot, so every snapshot-driven
   // arm above is structurally blind: the control plane keeps reading
   // `running`, a `running` sandbox is never re-started, and only the
@@ -526,7 +570,7 @@ describe("the vanished-pod arm (expected running, no snapshot)", () => {
   // once absence has held for two consecutive passes, and the ordinary wake
   // path recovers.
 
-  /** Start sb-1, let it settle running, then vanish its pod out-of-band. */
+  /** Start sb-1, let it settle running, then vanish it out-of-band. */
   const vanish = async (): Promise<void> => {
     queued.push(startItem("sb-1"));
     await drive();
@@ -563,7 +607,7 @@ describe("the vanished-pod arm (expected running, no snapshot)", () => {
     posted.length = 0;
 
     await runner.reconcile();
-    // The pod is back (a transient list blind spot healed), and healthy —
+    // The sandbox is back (a transient list blind spot healed), and healthy —
     // give it a live channel so the snapshot arms stay quiet too.
     backend.sandboxes.set("sb-1", record);
     connected.add("sb-1");
@@ -582,7 +626,7 @@ describe("the vanished-pod arm (expected running, no snapshot)", () => {
 
   it("never fires for a sandbox the control plane does not read as running", async () => {
     // `starting`/`stopping` are the 300s stale-claim's business; everything
-    // else expects no pod at all.
+    // else expects no sandbox at all.
     await vanish();
     const quiet = [
       "unprovisioned",
@@ -642,7 +686,7 @@ describe("the vanished-pod arm (expected running, no snapshot)", () => {
   });
 
   it("never fires while a start is QUEUED behind the sandbox's executing stop", async () => {
-    // The realistic shape: the pod vanishes while a stop is mid-execution
+    // The realistic shape: the sandbox vanishes while a stop is mid-execution
     // and the recovery start is already queued behind it on the chain.
     // MUTATION-PROOF: drop the queuedStarts fence and the expect fails —
     // the executing stop has already drained its queuedStops slot and no
@@ -784,6 +828,9 @@ describe("registration", () => {
       // Same gate for attachment manifests: only an advertising runner is
       // told about files, because only it can pull the bytes.
       attachments: true,
+      // And for the reverse direction: the supervisor is offered send_file
+      // only when its runner can relay the bytes.
+      outboundAttachments: true,
     });
     await spy.stop();
   });
@@ -1066,6 +1113,23 @@ describe("home sync fan-out", () => {
         prune: [".agents/skills/deploy/SKILL.md", "memory/index.md"],
         instructions: "Be brief.",
         agentName: "andy",
+        channels: [
+          {
+            provider: "slack",
+            status: "active",
+            handle: "andy",
+            workspaceName: "Acme",
+          },
+        ],
+        peers: [{ name: "Mark" }],
+        connections: [
+          {
+            provider: "salesforce",
+            name: "Salesforce",
+            label: "a@example.com",
+            host: "acme.my.salesforce.com",
+          },
+        ],
       },
     ],
     ...overrides,
@@ -1091,6 +1155,11 @@ describe("home sync fan-out", () => {
       of: 2,
       instructions: "Be brief.",
       agentName: "andy",
+      channels: [{ provider: "slack", status: "active", handle: "andy" }],
+      // Every final-part render input is relayed — a dropped field reads as
+      // "unchanged" at the supervisor and pins the old doc until reboot.
+      peers: [{ name: "Mark" }],
+      connections: [{ provider: "salesforce", host: "acme.my.salesforce.com" }],
     });
     expect(posted).toEqual([]);
   });
@@ -1221,7 +1290,7 @@ describe("the lifecycle executor (step 4)", () => {
 
   it("counts in-flight fresh creates against capacity", async () => {
     // N concurrent slots reading one stale live count would all pass at
-    // capacity − 1 — and a booting cloud pod is invisible to `running`.
+    // capacity − 1 — and a booting remote sandbox is invisible to `running`.
     runner = createRunner({
       config: { ...config, lifecycleConcurrency: 2 },
       backend,
@@ -1350,8 +1419,8 @@ describe("post-start boot-crash classification (step 4)", () => {
         reasonCode: "start_failed",
       },
     ]);
-    // The corpse is removed: it held the home's RWO claim, and the manager
-    // can neither park nor release the node while it exists.
+    // The corpse is removed: while it exists it still holds the home, so
+    // the backend can neither park nor release it.
     expect(backend.sandboxes.has("sb-1")).toBe(false);
     expect(runner.containerRefOf("sb-1")).toBeUndefined();
   });
@@ -1481,8 +1550,8 @@ describe("review fixes (step-4 whole-PR review)", () => {
   });
 
   it("does NOT classify a Pending-phase snapshot as a boot crash", async () => {
-    // The cloud create can return optimistically at its image-watch budget
-    // with the pod still Pending — slow, not dead. Only a terminal phase
+    // A remote create can return optimistically at its image-watch budget
+    // with the sandbox still Pending — slow, not dead. Only a terminal phase
     // (or a substrate with no phase concept) may classify.
     runner = createRunner({
       config,

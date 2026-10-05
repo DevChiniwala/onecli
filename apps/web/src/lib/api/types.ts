@@ -110,9 +110,9 @@ export interface CreatedSecret {
   pathPattern: string | null;
   createdAt: string;
   preview: string;
-  /** Agents this key was auto-attached to because they could reach no LLM key
-   * at all (see the API's `llm-autoattach-service`). Empty is normal — every
-   * agent already had one. */
+  /** Agents the new workspace secret was auto-attached to: every agent for a
+   * custom secret, only the agents that could reach no LLM key at all for an
+   * LLM key. Always empty for an org-level secret. */
   attachedAgents: string[];
 }
 
@@ -563,7 +563,7 @@ export interface AgentWithGrantsSummary extends Agent {
 }
 
 /** The current organization (`GET /v1/org`). `byoLegacy` is the org's
- * creation world on cloud (sandbox-platform §3.10, re-decided 2026-08-23):
+ * creation world on cloud:
  * false = hosted-first creation, true = BYO-only creation (hosted starts with
  * an onboarding call). `byoEnabled` (the mixed world, 2026-08-29) is only
  * read when `byoLegacy` is false: it additionally allows BYO creation beside
@@ -604,7 +604,7 @@ export interface InstanceInfo {
     homeDurability?: "resident" | "snapshot";
   };
   /**
-   * The SSH front door (sandbox-platform step 5): present only when this
+   * The SSH front door: present only when this
    * deployment can mint certificates and terminate SSH. Same optional-field
    * contract as `runners`: absent (an older API, or a deployment without the
    * front door) means "no SSH here" — the rail auto-hides the agent's SSH
@@ -613,7 +613,7 @@ export interface InstanceInfo {
   ssh?: {
     host: string;
     /** Public SSH port. Optional: an older API answers without it (assume
-     *  22). Cloud is 22 (the NLB); self-host a high port. */
+     *  22). Default 22; self-host a high port. */
     port?: number;
   };
 }
@@ -666,7 +666,12 @@ export interface MintedSshCertificate {
 
 // ── Conversations (plans/hosted-agents-v2.md step 4) ────────────────────────
 
-export type ConversationSource = "web" | "slack" | "cron" | "watch";
+export type ConversationSource =
+  | "web"
+  | "slack"
+  | "cron"
+  | "watch"
+  | "greeting";
 
 export interface Conversation {
   id: string;
@@ -745,8 +750,30 @@ export interface AttachmentMeta {
   name: string;
   mimeType: string;
   sizeBytes: number;
-  /** "pending" | "bound" | "failed" — a failed row renders the honest chip. */
+  /** "pending" | "bound" | "failed" | "expired" — a failed row renders the
+   * honest chip; an expired one (retention took the bytes) a quiet one. */
   status: string;
+  /** Who sent it: "inbound" (the person, under their bubble) or "outbound"
+   * (the agent's send_file, under its answer). Optional: an older API omits
+   * it, and every such row is inbound. */
+  direction?: "inbound" | "outbound";
+  /** The agent's one-line note for an outbound file. */
+  caption?: string | null;
+  /** When it landed on the turn (ISO). Optional: an older API omits it. */
+  createdAt?: string;
+}
+
+/**
+ * What the Files page reads: the row plus where it came from. The page has
+ * no agent frame around it, so the agent's name and the conversation's
+ * surface ("slack", "web", "cron"…) travel with the metadata.
+ */
+export interface AttachmentPageMeta extends AttachmentMeta {
+  createdAt: string;
+  conversation: {
+    source: string;
+    agent: { id: string; name: string };
+  };
 }
 
 export interface Turn {
