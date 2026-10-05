@@ -9,10 +9,10 @@ import { ManagerApiError } from "./manager-client";
 import { startFakeManager, type FakeManager } from "./manager-fake";
 
 /**
- * Conformance of the cloud backend against the manager's HTTP contract —
- * through the REAL manager-client over a real socket (the fake is a
- * hand-rolled node:http server, never an import of the cloud-only
- * apps/sandbox-manager). Mirrors docker-backend.test.ts's role for the seam.
+ * Conformance of the cloud backend against the remote service's HTTP
+ * contract — through the REAL manager-client over a real socket (the fake is
+ * a hand-rolled node:http server, never an import of the real service).
+ * Mirrors docker-backend.test.ts's role for the seam.
  */
 
 let manager: FakeManager;
@@ -106,7 +106,7 @@ describe("createSandbox", () => {
       backend.identify("rnr1");
 
       const pending = backend.createSandbox(spec());
-      // The pod goes into an image-pull refusal after creation. Wait until
+      // The sandbox goes into an image-pull refusal after creation. Wait until
       // the create actually landed before arming the reason — a fixed sleep
       // loses to a slow POST on a loaded box, arms an empty map, and the
       // watch then legitimately returns the ref at budget. The settled
@@ -146,7 +146,7 @@ describe("createSandbox", () => {
   });
 
   it("FAILS CLOSED against a skewed 2xx create body — never an undefined ref", async () => {
-    // A version-skewed manager (or an intermediary) answering 2xx JSON of
+    // A version-skewed service (or an intermediary) answering 2xx JSON of
     // another shape must be the honest typed refusal, not `undefined`
     // flowing into refs until `/v1/sandboxes/undefined/start` dies later.
     manager.nextCreateBody = { ok: true };
@@ -210,9 +210,9 @@ describe("lifecycle mapping", () => {
   });
 
   it("stop/remove carry the sandboxId hint as a query param when the caller has it", async () => {
-    // The hint lets the manager resolve the pod with a label-scoped list
-    // instead of a fleet-wide scan (step 4). Optional and additive: the
-    // ref-only form above must keep working against any manager.
+    // The hint lets the service resolve the sandbox with a scoped lookup
+    // instead of a fleet-wide scan. Optional and additive: the
+    // ref-only form above must keep working against any service.
     const backend = backendFor();
     await backend.stopSandbox("pod-1", "sbx1");
     await backend.removeSandbox("pod-1", "sbx1");
@@ -233,7 +233,7 @@ describe("lifecycle mapping", () => {
         containerRef: "pod-uid-1",
         running: true,
         payloadHash: "a".repeat(64),
-        // The pod phase rides along so the boot-crash classifier can tell a
+        // The substrate phase rides along so the boot-crash classifier can tell a
         // terminal container from one still Pending behind an image pull.
         phase: "Running",
       },
@@ -320,6 +320,31 @@ describe("park and wake polling", () => {
       request.path.endsWith("/wake"),
     );
     expect(wakeCalls).toHaveLength(3);
+    // No workspace: no body. An existing home needs no placement.
+    for (const call of wakeCalls) expect(call.body).toBeUndefined();
+  });
+
+  it("a wake given the workspace sends the create body's placement trio on EVERY poll (the manager may birth a brand-new home from it)", async () => {
+    manager.wakeStatuses.splice(
+      0,
+      manager.wakeStatuses.length,
+      "waking",
+      "ready",
+    );
+    const backend = backendFor();
+    backend.identify("rnr-stable");
+    await backend.wakeHome("home-sbx1", "ws1");
+    const wakeCalls = manager.requests.filter((request) =>
+      request.path.endsWith("/wake"),
+    );
+    expect(wakeCalls).toHaveLength(2);
+    for (const call of wakeCalls) {
+      expect(call.body).toEqual({
+        workspaceId: "ws1",
+        runnerId: "rnr-stable",
+        installationId: "aabbccdd",
+      });
+    }
   });
 
   it("wake throws at its ceiling — the caller must never map a half-restored home", async () => {

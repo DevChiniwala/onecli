@@ -169,6 +169,10 @@ fn serialize_extra_data(event: &RequestEvent) -> Option<String> {
         RequestDecision::BlockedByDefaultPolicy => {
             obj["decision"] = serde_json::json!("blocked_by_default_policy");
         }
+        RequestDecision::NeedsConnection { ref error } => {
+            obj["decision"] = serde_json::json!("needs_connection");
+            obj["guidance_error"] = serde_json::json!(error);
+        }
         RequestDecision::Allowed => {}
     }
     if let Some(ref label) = event.connection_label {
@@ -201,8 +205,8 @@ struct FlushContext {
 /// Initialize the telemetry background flush task.
 /// Must be called once at startup from `main()`.
 pub fn init(pool: PgPool, cache: Arc<dyn CacheStore>) {
-    // No baked-in defaults: both come from the deployment env (the cloud task
-    // definition sets them), and PostHog stays self-disabled unless BOTH are
+    // No baked-in defaults: both come from the deployment env, and PostHog
+    // stays self-disabled unless BOTH are
     // present — an API key with nowhere to send it is still off.
     let api_key = std::env::var("POSTHOG_API_KEY").unwrap_or_default();
     let api_host = std::env::var("POSTHOG_HOST").unwrap_or_default();
@@ -572,6 +576,26 @@ mod tests {
             rule_name: "r".into(),
         };
         assert!(keeps_event(&blocked, Edition::Onprem));
+    }
+
+    /// A gateway guidance answer (the agent hit the wrong Salesforce host)
+    /// is un-injected and not a block — as `Allowed` it was silently dropped
+    /// and the failure never reached the activity feed. It must persist in
+    /// every edition, and say which guidance the agent got.
+    #[test]
+    fn guidance_answers_are_persisted_and_labelled() {
+        let mut ev = base_event();
+        ev.injected = false;
+        ev.provider = "salesforce".into();
+        ev.decision = crate::core::RequestDecision::NeedsConnection {
+            error: "connection_host_mismatch".into(),
+        };
+        assert!(keeps_event(&ev, common::edition::Edition::Cloud));
+        assert!(keeps_event(&ev, common::edition::Edition::Onprem));
+        let extra: serde_json::Value =
+            serde_json::from_str(&serialize_extra_data(&ev).expect("extra data")).unwrap();
+        assert_eq!(extra["decision"], "needs_connection");
+        assert_eq!(extra["guidance_error"], "connection_host_mismatch");
     }
 
     #[test]
