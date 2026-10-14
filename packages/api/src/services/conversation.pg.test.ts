@@ -216,10 +216,10 @@ beforeAll(async () => {
   process.env.DATABASE_URL = PROOF_URL;
   // Pin the edition BEFORE any dynamic import below loads `lib/env`: this
   // suite's paths reach edition slots (door 2's decryptability probe hits
-  // getCrypto), and its assertions are onprem semantics. Vitest isolates
-  // modules per file but `process.env` LEAKS across files in a reused
-  // worker — without the pin the suite inherits whatever edition the
-  // previous file left behind (CI's ambient NEXT_PUBLIC_EDITION is cloud).
+  // getCrypto), and its assertions are onprem semantics. Every file starts
+  // from the lane's edition (the hermetic setup resets env per file), and
+  // CI's cloud lane carries NEXT_PUBLIC_EDITION=cloud, so the pin is what
+  // makes this suite onprem in both lanes.
   process.env.EDITION = "onprem";
   process.env.NEXT_PUBLIC_EDITION = "onprem";
   // Door 2 embeds the gateway CA into the spawn payload; provide it here.
@@ -1396,6 +1396,60 @@ describe.skipIf(!PROOF_URL)("finishTurn and the cold-death revival", () => {
     expect(row?.status).toBe("failed");
     expect(row?.error).toBe("Error: unknown session: fake-session-1");
     expect(row?.retriedAt).toBeNull();
+  });
+
+  it("the runner's channel-loss batch, stopped FIRST, survives a poll between its two reports: one revival, one fresh boot, zero strands", async () => {
+    // The runner reports a channel loss as [sandbox.status(stopped),
+    // turn.finished(agent_restarted)] in THAT order, and its own poll loop
+    // can run between the two. Stopped-first: the strand door revives the
+    // never-started turn and flips the box to `unprovisioned`, so a poll in
+    // between claims the box off its queued turn (a start, not a turn: the
+    // turn arm needs `running`). The turn report then finds a `queued` row
+    // and is inert. The other order is a hole the runner avoids by
+    // construction: the finish door revives without waking (the box still
+    // reads `running`), a poll in between hands the revived turn straight
+    // back to the dying box, and the `stopped` then finds the once-fence
+    // spent and strands it. Seen on CI before the reorder.
+    const { conversationId, sandboxId } = await seedTalkable("fin-order");
+    const turn = await turns.createTurn(
+      WORKSPACE,
+      conversationId,
+      "cold",
+      WEB_A,
+    );
+    await dueWork.claimDueWork(RUNNER_A, 5);
+
+    await sandboxes.applyRunnerEvent(RUNNER_A, {
+      kind: "sandbox.status",
+      sandboxId,
+      status: "stopped",
+    });
+    let row = await db.turn.findUnique({ where: { id: turn.id } });
+    expect(row?.status).toBe("queued");
+    expect(row?.retriedAt).not.toBeNull();
+    expect(
+      (await db.sandbox.findUnique({ where: { id: sandboxId } }))?.status,
+    ).toBe("unprovisioned");
+
+    // The poll in between: the box is claimed for a fresh boot, the turn
+    // stays queued for it (never handed to the dead incarnation).
+    const work = await dueWork.claimDueWork(RUNNER_A, 5);
+    expect(work.map((item) => item.kind)).toEqual(["start"]);
+    row = await db.turn.findUnique({ where: { id: turn.id } });
+    expect(row?.status).toBe("queued");
+
+    await turns.finishTurn({
+      reporter: reporter(RUNNER_A, sandboxId),
+      conversationId,
+      turnId: turn.id,
+      status: "failed",
+      error: "The agent was restarting. Send the message again.",
+      errorCode: "agent_restarted",
+    });
+
+    row = await db.turn.findUnique({ where: { id: turn.id } });
+    expect(row?.status).toBe("queued");
+    expect(row?.error).toBeNull();
   });
 
   it("a LATE failed report cannot kill a just-revived queued turn", async () => {
