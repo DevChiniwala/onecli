@@ -6,15 +6,20 @@ import {
   JcodeClient,
   launchInstance,
   type ApiEvent,
+  type HistoryMessage,
+  type ImageAttachment,
 } from "@1jehuang/jcode-sdk";
 import {
   TURN_FAILURE_CODES,
   type AgentEffort,
   type AgentEvent,
+  type BackgroundedTool,
   type Harness,
+  type HarnessEvent,
   type HarnessSession,
   type StartSessionOptions,
   type SteerInput,
+  type TurnImage,
   type TurnInput,
   type TurnUsage,
 } from "@onecli/agent-protocol";
@@ -25,6 +30,13 @@ import { mergeBackgroundTasks } from "./background-merge";
 import { createJcodeBackgroundTasks } from "./jcode-background";
 import { forwardJcodeStderr, startJcodeLogForwarder } from "./jcode-log";
 import { createJcodeSwarmTasks } from "./jcode-swarm";
+import {
+  createLiveSteerTracker,
+  type LiveSteerTracker,
+  type SteerEvent,
+  type SteerFrame,
+} from "./jcode-steer";
+import { readJcodeToolOutput } from "./jcode-tool-output";
 import { healJcodeTranscripts } from "./jcode-transcript-heal";
 import { createJcodeWakeFeed } from "./jcode-wake";
 
@@ -35,8 +47,9 @@ import { createJcodeWakeFeed } from "./jcode-wake";
  * (invariant 9).
  *
  * Every switch below was verified against jcode v0.71.x source and
- * re-verified against v0.78.1 (2026-08-19) and v0.81.1 (2026-08-26) at the pin bumps
- * (see plans/hosted-agents-v2.md §3.2/§3.5):
+ * re-verified against v0.78.1 (2026-08-19), v0.81.1 (2026-08-26), v0.90.0
+ * (2026-10-01), v0.90.1 (2026-10-05) and v0.94.0 (2026-10-11) at the pin
+ * bumps:
  * - `inheritLogins: false` — never import host provider logins (zero-cred).
  * - `JCODE_NO_TELEMETRY=1` — telemetry is on by default upstream.
  * - `JCODE_NO_AUTO_UPDATE=1` — the updater is on by default upstream, checks
@@ -65,9 +78,23 @@ import { createJcodeWakeFeed } from "./jcode-wake";
  *   native-messaging host) that can never work in a headless guest, and
  *   its own description tells the model to "check status first, run setup
  *   if not ready" — observed live burning a whole turn on setup attempts
- *   before declaring browsing impossible. The agent image bakes chromium
- *   instead (docker/agent.Dockerfile); Playwright/Puppeteer from npm or pip
- *   drive it, and the machine fragment says so.
+ *   before declaring browsing impossible. The agent image bakes a browser
+ *   instead (docker/agent-base.Dockerfile) and the `onecli-browser` driver
+ *   that drives it (src/browser-driver), and the machine fragment says so.
+ *   `applet,panel,side_panel` joined 2026-10-19: all three draw into the
+ *   vendor's own desktop app (applet cards, Markdown/PDF side-panel pages),
+ *   which no platform surface shows, yet each reports success. Observed
+ *   live: after an applet call an agent told a person on Slack "the card is
+ *   right above your message" when nothing was there. Charts go out as
+ *   image files instead (the send-file fragment says so). Upstream v0.99
+ *   registers `applet` only for its desktop app but still registers both
+ *   panel tools for every session.
+ *   `calendar,compile_remote` joined 2026-10-19 under the same two laws as
+ *   `gmail` and `jcode_docs`: unconfigured, `calendar` answers with the
+ *   vendor's own Google login and points the model at `jcode_docs` (a call
+ *   to a disabled tool ends the turn), and `compile_remote` uploads source
+ *   to the vendor's build service under a vendor account, pitching its
+ *   subscription. Calendars, like email, go through the gateway.
  *   ⛔ Never add the literal name `mcp` to this list: since v0.75 it is a
  *   meta-entry covering every dynamic `mcp__*` tool, so it would silently
  *   kill the platform-tools bridge.
@@ -102,11 +129,69 @@ import { createJcodeWakeFeed } from "./jcode-wake";
  *   advertised list). See the trap note on managedConfigToml.
  * - `[provider] stream_idle_timeout_secs=300` — invariant 4: must exceed the
  *   gateway's 180 s approval hold (jcode's default is exactly 180).
+ * - `[provider] anthropic_cache_ttl_1h=true`: one-hour prompt caching on the
+ *   Anthropic route. The key (v0.86+) already defaults on; it is stated so a
+ *   default flip cannot shrink the cache to 5 minutes and make a reply after
+ *   a short pause re-process the whole conversation.
+ * - `[compaction] max_context_tokens=200000`: caps the budget compaction
+ *   measures against (a v0.85+ key whose default, 0, means the model's own
+ *   window). Without it a 1M-window model folds nothing until ~800k tokens,
+ *   and every request re-sends the whole transcript. With it, background
+ *   summarization starts at 80% of the cap, keeping the newest messages
+ *   verbatim. A conversation already at 95% when a request goes out is cut
+ *   synchronously instead: older messages leave the model's view with only a
+ *   short note in their place (the stored transcript keeps them, and
+ *   `conversation_search` still reads them). Models whose window is already
+ *   at or under the cap are unaffected, and so is the OpenAI route, which
+ *   compacts on the provider's side.
  * - `[auth] trusted_external_sources` — jcode's consent gate for reading
  *   `CLAUDE_CODE_OAUTH_TOKEN`; pre-trusted because we own this home.
+ * - `JCODE_RUNTIME_PROVIDER`: the Anthropic credential ROUTE, pinned at
+ *   launch from the grant (see resolveAnthropicCredential). Unpinned, the
+ *   runtime picks OAuth-vs-key itself, and a resumed session can re-pick it
+ *   for the whole process.
  */
 
 const JCODE_HOME_DIRNAME = ".jcode-home";
+
+/**
+ * How the launch should present the agent's Anthropic grant to jcode.
+ *
+ * `route` is jcode's own `JCODE_RUNTIME_PROVIDER` vocabulary: `claude` pins
+ * the Claude subscription (OAuth) route, `claude-api` the direct API-key
+ * route. It is pinned because jcode's AUTOMATIC credential mode (what runs
+ * when nothing is pinned) prefers any loadable OAuth account over
+ * `ANTHROPIC_API_KEY`, and resuming a session that was persisted on the
+ * API-key route re-pins the route process-wide from that moment on. Without
+ * the pin, OAuth-vs-key therefore depends on which sessions a boot happens
+ * to resume (verified against the pinned runtime). Bare `JCODE_PROVIDER=
+ * claude` does not help here: upstream treats it as a provider hint that
+ * deliberately keeps automatic mode.
+ *
+ * `oauthStub` says whether the placeholder account belongs in the instance's
+ * `auth.json`: exactly when the route is `claude`, which the union encodes
+ * so no caller can pair a stub with the key route. The file lives on the
+ * durable home, so a grant that moved from an OAuth token to an API key
+ * would otherwise keep a stale OAuth account there for the life of the
+ * volume.
+ *
+ * An API key wins when both are present (matching the control plane, which
+ * hands out one or the other); empty values count as unset. No Anthropic
+ * grant at all pins nothing, so an OpenAI-only agent keeps the runtime's own
+ * provider selection.
+ */
+export type AnthropicCredential =
+  | { route: "claude"; oauthStub: true }
+  | { route: "claude-api"; oauthStub: false }
+  | { route: undefined; oauthStub: false };
+
+export const resolveAnthropicCredential = (
+  env: NodeJS.ProcessEnv,
+): AnthropicCredential => {
+  if (env.ANTHROPIC_API_KEY) return { route: "claude-api", oauthStub: false };
+  if (env.CLAUDE_CODE_OAUTH_TOKEN) return { route: "claude", oauthStub: true };
+  return { route: undefined, oauthStub: false };
+};
 
 /**
  * The agent's POSIX home under the workspace volume — byte-equal with the
@@ -278,6 +363,10 @@ check_updates = false
 
 [provider]
 stream_idle_timeout_secs = 300
+anthropic_cache_ttl_1h = true
+
+[compaction]
+max_context_tokens = 200000
 
 [tools]
 mcp_tools = "eager"
@@ -300,7 +389,7 @@ enabled = false
  * upstream, so it reapplies on every config load and an agent editing its
  * own config.toml cannot flip it back).
  */
-export const JCODE_MCP_TOOLS_ENV_VALUE = "eager";
+const JCODE_MCP_TOOLS_ENV_VALUE = "eager";
 
 /**
  * Sub-agent fan-out is ALWAYS ON for hosted agents (a product decision:
@@ -450,7 +539,7 @@ export const SWARM_PROMPT_OVERRIDE = `Guidance for spawning helper agents.
  * would pin nothing). Rationale per entry lives in the adapter header above.
  */
 export const JCODE_DISABLED_TOOLS_VALUE =
-  "schedule,skill_manage,gmail,integration_tools,memory,maintainer_feedback,jcode_docs,browser";
+  "schedule,skill_manage,gmail,integration_tools,memory,maintainer_feedback,jcode_docs,browser,applet,panel,side_panel,calendar,compile_remote";
 
 /**
  * THE PLATFORM'S BASE SYSTEM PROMPT — it REPLACES the harness's built-in one.
@@ -469,13 +558,33 @@ export const JCODE_DISABLED_TOOLS_VALUE =
  * iteration, the todo tool, and markdown/conciseness. What is dropped: the
  * vendor's name, the coding-agent framing, commit-as-you-go, its multi-agent
  * worktree lore, and its CLI-display and prose-style micromanagement.
+ *
+ * ONE HOME PER RULE. This prompt owns the agent's standing LAW (identity,
+ * autonomy, the wake contract, gateway-first and its one exception, voice);
+ * the rendered instruction document owns FACTS and MECHANICS (which tools
+ * exist, paths, limits, how to call). A rule stated here is not restated
+ * there: the whole text is paid for on every turn and every helper, and a
+ * second copy teaches nothing the first did not. The budget was audited at
+ * ~5.6k always-loaded tokens (2026-10), with the duplicates removed then.
+ *
+ * The batching rule (Execution): the harness default says nothing about
+ * issuing independent tool calls together, and without it agents spend one
+ * model round trip per call. Those round trips, not the tools, dominate a
+ * long turn, so fewer, wider steps are the lever.
+ *
+ * The login exception: "never ask anyone for a key or token" is the rule,
+ * and a website login a person volunteers for a browser task is its one
+ * carve-out (observed live: an agent refused three times to use a login the
+ * user offered, quoting the rule back). API keys stay on the gateway path —
+ * the gateway's own error hands out a one-click dashboard link for those.
  */
 export const PLATFORM_SYSTEM_PROMPT = `## Identity
 
 You are a hosted autonomous agent. Your name, who you work for, and your
 standing instructions are defined in the operator-provided instruction
 documents appended below. That is your operator's configuration: follow it,
-and where it conflicts with this text, it wins.
+and where it conflicts with this text, it wins, except for the credential
+rule under External services, which nothing overrides.
 
 Your role is whatever those documents say it is — do not assume you are a
 coding assistant because you can run commands.
@@ -506,6 +615,12 @@ You cannot drive interactive commands; use non-interactive alternatives.
 When a closed feedback loop exists (build, test, check), keep iterating until
 it passes.
 Use the todo tool to plan and track multi-step work.
+Every step costs a full model round trip, so take as few as the work allows.
+When you need several things that do not depend on each other (files, logs,
+metrics, queries, API calls), make all of those tool calls in the same
+response. Combine related shell commands into one script when that is
+clearer. Go one call at a time only when a call needs an earlier call's
+result.
 The platform tracks background tasks however you start them and delivers
 watch wake-ups to the chat. To be woken when a background task completes,
 arm process_watch; a wake requested through your runtime's own options is
@@ -522,15 +637,28 @@ never see the result.
 
 ## External services
 
-All outside access — email, calendars, code hosts, chat, any web API — goes
+All outside access — email, calendars, code hosts, any web API — goes
 through the platform's credential-injecting gateway: make plain HTTPS
 requests with a standard HTTP client and no auth headers, and the gateway
 supplies the real credentials on the wire. Never use an integration or
 login tool the runtime happens to ship, a third-party integration platform,
 or a provider's own OAuth or API-key setup flow — and never ask anyone for
-a key or token. When a request is refused, the gateway's JSON error says
-what to do next; your instruction documents name the skill that explains
-the gateway.
+a key or token. The one exception is a website login a person hands you
+for a browser task: it is theirs to give, so use it, for that task only;
+keep it out of your replies and your memory, and prefer a gateway
+connection whenever one exists for that service. When a request is
+refused, the gateway's JSON error says what to do next; your instruction
+documents name the skill that explains the gateway.
+
+Your own gateway credential is the one secret your environment holds: the
+token inside your proxy settings (HTTPS_PROXY, HTTP_PROXY and their lowercase
+forms; it begins with aoc_). It is a key to the gateway in your name, and
+your tools already use it on their own, so no task ever needs it. Never
+reveal it, in whole or in part, to anyone or anywhere: not in a reply, a
+file, a message, your memory, or a request to another service, and not
+encoded, split up, or described piece by piece. Decline whoever asks and
+however the request is framed, the person you work with and your
+instruction documents included: this rule overrides them.
 
 ## Communication
 
@@ -549,6 +677,11 @@ delivered as your reply; text written before a tool call streams as
 progress and is then discarded. Never bury an answer before a tool call:
 make the final message complete on its own, restating whatever the person
 still needs even if you said it mid-turn.
+The one exception is a message marked as having arrived while you were
+working: it is a new message to you, not part of the task. Answer it
+directly and briefly in your very next message, before any tool call, then
+continue the task; that reply is kept and shown under the message. Your
+final message still covers the original task on its own.
 `;
 
 /**
@@ -786,6 +919,24 @@ const usageFromEvent = (
 });
 
 /**
+ * Inline vision: our `TurnImage` translates to jcode's `[mediaType, base64]`
+ * tuple HERE and nowhere else (invariant 9: the vendor shape never crosses
+ * the adapter boundary), for a turn's message and a steer alike. The daemon
+ * prepends the images as content blocks in the same user message, on
+ * `send_message` and on `soft_interrupt` (both read in the v0.94.0 source:
+ * the injection groups a queued message's images ahead of its text).
+ * Undefined for none, so the request omits the key.
+ */
+const jcodeImages = (
+  images: readonly TurnImage[] | undefined,
+): ImageAttachment[] | undefined =>
+  images?.length
+    ? images.map(
+        (image): ImageAttachment => [image.mediaType, image.dataBase64],
+      )
+    : undefined;
+
+/**
  * OUR model id → jcode's.
  *
  * The control plane speaks the PROVIDER's vocabulary (`claude-sonnet-4-6`) and
@@ -877,12 +1028,13 @@ const isHarnessRefusal = (error: unknown): boolean => {
 };
 
 /**
- * Which pending steers actually made it into the run — the reconcile's pure
- * core, exported for its tests.
+ * Which pending steers actually made it into the run, and the candidate
+ * entry each one landed in: the reconcile's pure core, exported for its
+ * tests.
  *
  * jcode drains its soft-interrupt queue at a safe point, joins the grouped
  * texts with "\n\n", and appends them as ONE fresh user message (verified in
- * v0.71.1 `interrupts.rs`; byte-identical through v0.81.1). So each steer's text
+ * v0.71.1 `interrupts.rs`; byte-identical through v0.94.0). So each steer's text
  * always lands inside a
  * SINGLE history entry, and the match is per-entry substring, longest steer
  * first, consuming each matched span:
@@ -901,9 +1053,9 @@ const isHarnessRefusal = (error: unknown): boolean => {
 export const matchJoinedSteers = (
   pending: readonly SteerInput[],
   candidateContents: readonly string[],
-): string[] => {
+): { id: string; entry: number }[] => {
   const entries = [...candidateContents];
-  const joined: string[] = [];
+  const joined: { id: string; entry: number }[] = [];
   for (const steer of [...pending].sort(
     (a, b) => b.message.length - a.message.length,
   )) {
@@ -912,12 +1064,101 @@ export const matchJoinedSteers = (
       const entry = entries[i] ?? "";
       const at = entry.indexOf(steer.message);
       if (at === -1) continue;
-      joined.push(steer.id);
+      joined.push({ id: steer.id, entry: i });
       entries[i] = entry.slice(0, at) + entry.slice(at + steer.message.length);
       break;
     }
   }
   return joined;
+};
+
+/**
+ * One line of the agent's REASONING as jcode renders it into history: the
+ * whole line wrapped `*` + U+2063 … U+2063 + `*`, ending in a hard break.
+ * jcode prefixes an assistant entry's text with these when its reasoning
+ * display is on (`show_thinking`, default on), so they are not words the
+ * agent said to the person. Verified identical in v0.90.1 and v0.94.0
+ * (`jcode-render-core` `reasoning_line_markup`, whose own decoder keys on the
+ * same two sentinels).
+ */
+const RENDERED_REASONING_LINE = /^\*\u2063.*\u2063\* {2}$/;
+
+/** An assistant history entry's text with jcode's rendered reasoning lines
+ * removed: exactly the words the agent streamed. */
+const spokenText = (content: string): string =>
+  content
+    .split("\n")
+    .filter((line) => !RENDERED_REASONING_LINE.test(line))
+    .join("\n")
+    .trim();
+
+/**
+ * What the agent said back to an injected message: the assistant entry that
+ * directly follows it in the session history, when it said something before
+ * doing anything else. The reconcile's other pure core, exported for its
+ * tests.
+ *
+ * The history renders each assistant message as its own entry, split at
+ * every tool result, so its text (less the reasoning lines jcode renders in
+ * front of it, see `spokenText`) is exactly what the agent streamed.
+ * Display-only entries jcode slots in between (`system`,
+ * `background_task`) are skipped. Any other role first (a tool result: the
+ * agent went straight to work; another user message: a later injection)
+ * means it gave no separate reply, and the turn's own answer covers the
+ * message.
+ */
+export const replyAfter = (
+  history: readonly HistoryMessage[],
+  injectedAt: number,
+): string | undefined => {
+  for (const entry of history.slice(injectedAt + 1)) {
+    if (entry.role === "system" || entry.role === "background_task") continue;
+    if (entry.role !== "assistant") return undefined;
+    return spokenText(entry.content) || undefined;
+  }
+  return undefined;
+};
+
+/**
+ * The settled steers of one turn, in send order, each with what the agent
+ * said back to it: the matcher over the user entries from `floor` on (this
+ * turn's injections), then `replyAfter` at the entry each one landed in.
+ * Exported for its tests.
+ *
+ * Steers injected together share one entry and so one reply. It goes to the
+ * LAST of them in send order: the bubble a reader sees the reply under, and
+ * the message the agent answered with everything before it in view.
+ */
+export const settleSteers = (
+  pending: readonly SteerInput[],
+  history: readonly HistoryMessage[],
+  floor: number,
+): { followUpId: string; reply?: string }[] => {
+  const candidates = history.flatMap((entry, index) =>
+    index >= floor && entry.role === "user" ? [{ index, entry }] : [],
+  );
+  const landedAt = new Map<string, number>();
+  for (const { id, entry } of matchJoinedSteers(
+    pending,
+    candidates.map(({ entry }) => entry.content),
+  )) {
+    const candidate = candidates[entry];
+    if (candidate) landedAt.set(id, candidate.index);
+  }
+  // Each entry's replier: the last joined steer that landed there, in send
+  // order. A Map keeps the last write.
+  const replierAt = new Map<number, string>();
+  for (const steer of pending) {
+    const at = landedAt.get(steer.id);
+    if (at !== undefined) replierAt.set(at, steer.id);
+  }
+  return pending.flatMap((steer) => {
+    const at = landedAt.get(steer.id);
+    if (at === undefined) return [];
+    const reply =
+      replierAt.get(at) === steer.id ? replyAfter(history, at) : undefined;
+    return [{ followUpId: steer.id, ...(reply !== undefined && { reply }) }];
+  });
 };
 
 /**
@@ -928,6 +1169,21 @@ export const matchJoinedSteers = (
  * (invariant 9 — the vendor's vocabulary never crosses this boundary).
  */
 const BUSY_REFUSAL_SHAPE = /already processing a message/i;
+
+/**
+ * The handshake capability under which the daemon tags each queued message
+ * with our `client_id` and reports `soft_interrupt_injected` the moment it
+ * lands (jcode ≥ v0.94.0, jcode#1778). Exported for the pin test: the
+ * adapter's live pickup path hangs on this exact string.
+ */
+export const SOFT_INTERRUPT_IDS_CAPABILITY = "soft_interrupt_ids";
+
+/**
+ * The handshake capability under which the daemon answers `background_tool`
+ * with what it actually moved (jcode ≥ v0.94.0, jcode#1778). Exported for
+ * the pin test: SEND NOW only asks a daemon that can say what happened.
+ */
+export const BACKGROUND_TOOL_RESULT_CAPABILITY = "background_tool_result";
 
 /**
  * The daemon's cancel-path error wording. During the settle phase, after this
@@ -943,7 +1199,7 @@ const ORPHAN_CANCEL_SHAPE = /cancelled by user/i;
  * genuine model delta takes longer than this window in practice, so in the
  * common no-orphan case the hold delays nothing observable.
  */
-export const BUSY_DETECT_WINDOW_MS = 1_000;
+export const BUSY_DETECT_WINDOW_MS = { value: 1_000 };
 
 /**
  * Backoff between self-heal resends, exported for the adapter tests. Bounded
@@ -955,7 +1211,7 @@ export const BUSY_DETECT_WINDOW_MS = 1_000;
 export const BUSY_RESEND_DELAYS_MS = [2_000, 5_000, 10_000, 30_000, 60_000];
 
 /** How long a heal round drains orphan residue before resending. */
-const ORPHAN_DRAIN_MIN_MS = 250;
+export const ORPHAN_DRAIN_MIN_MS = { value: 250 };
 
 /** While the fence is pending the live loop wakes on this tick to honor an
  * abort (a foreign run may be holding the daemon's request loop, so no
@@ -989,11 +1245,20 @@ export const POST_ACCEPT_IDLE_MS = { value: 600_000 };
  */
 export const ABORT_TERMINAL_GRACE_MS = { value: 10_000 };
 
+/**
+ * Ceiling on one tool call's accumulated arguments, kept below the runner's
+ * per-string wire bound (MAX_EVENT_TEXT_CHARS = 16,000) with room for the
+ * truncation marker, so the runner never cuts it a second time. Exported
+ * for the tests.
+ */
+export const TOOL_INPUT_MAX_CHARS = 15_900;
+
 /** Foreign-frame kinds worth counting when quarantined — the ones the live
  * loop would otherwise have surfaced or recorded. Everything else (acks,
  * status broadcasts) is dropped by the default arm even when trusted. */
 const QUARANTINE_COUNTED = new Set([
   "text_delta",
+  "text_replace",
   "reasoning_delta",
   "tool_start",
   "tool_done",
@@ -1017,7 +1282,16 @@ class JcodeSession implements HarnessSession {
    * never be resent — the user's cancel outranks the recovery.
    */
   private abortRequested = false;
-  /** Steers delivered to the LIVE turn, reconciled at its terminal. */
+  /**
+   * The live turn's steers. With the daemon's `soft_interrupt_ids`
+   * capability each one is tagged with its id and confirmed the moment it is
+   * injected (`jcode-steer.ts`); without it, `pendingSteers` holds them for
+   * the turn-end history reconcile. Exactly one of the two is in use per
+   * session, decided once at the first steer from the handshake.
+   */
+  private liveSteers: LiveSteerTracker | null = null;
+  /** Steers delivered to the LIVE turn, reconciled at its terminal (the
+   * capability-absent path). */
   private pendingSteers: SteerInput[] = [];
   /**
    * History length right after this turn's message was accepted — the floor
@@ -1057,12 +1331,10 @@ class JcodeSession implements HarnessSession {
     await this.onRelease?.();
   }
 
-  async *runTurn(input: TurnInput): AsyncIterable<AgentEvent> {
+  async *runTurn(input: TurnInput): AsyncIterable<HarnessEvent> {
     // Subscribe BEFORE sending, or a short turn's first deltas race the
-    // subscription (verified SDK behavior — run() does the same).
-    const stream = this.client.events(
-      this.sessionRef,
-    ) as AsyncIterableIterator<ApiEvent>;
+    // subscription (verified SDK behavior: run() does the same).
+    const stream = this.client.events(this.sessionRef);
     let usage: TurnUsage | undefined;
     let terminal: Extract<AgentEvent, { type: "turn.done" | "error" }> | null =
       null;
@@ -1196,7 +1468,11 @@ class JcodeSession implements HarnessSession {
       }
       if (!QUARANTINE_COUNTED.has(frame.ev)) return;
       droppedForeignFrames += 1;
-      if (frame.ev === "text_delta" || frame.ev === "reasoning_delta") {
+      if (
+        frame.ev === "text_delta" ||
+        frame.ev === "text_replace" ||
+        frame.ev === "reasoning_delta"
+      ) {
         droppedForeignTextChars += frame.text.length;
       }
     };
@@ -1210,6 +1486,13 @@ class JcodeSession implements HarnessSession {
       // refusal here must not cost the turn.
       await this.client.cancelSoftInterrupts(this.sessionRef).catch(() => {});
       this.pendingSteers = [];
+      // The pickup signal for THIS turn: live and exact when the daemon tags
+      // injections with our ids, the turn-end history reconcile otherwise.
+      // Decided per turn from the handshake, so a session that outlives a
+      // daemon upgrade (resume) picks the better path next turn.
+      this.liveSteers = this.client.supports(SOFT_INTERRUPT_IDS_CAPABILITY)
+        ? createLiveSteerTracker()
+        : null;
       this.abortRequested = false;
       this.turnActive = true;
       // A stale floor from a previous turn must never survive into this
@@ -1219,16 +1502,7 @@ class JcodeSession implements HarnessSession {
       // against an old-era window.
       this.turnHistoryBaseline = null;
 
-      // Inline vision: our TurnImage translates to jcode's [mediaType,
-      // base64] tuple HERE and nowhere else (invariant 9 — the vendor shape
-      // never crosses the adapter boundary). The daemon prepends the images
-      // as content blocks in the same user message (verified v0.71.1,
-      // unchanged through v0.81.1).
-      const images = (input.images ?? []).map((image): [string, string] => [
-        image.mediaType,
-        image.dataBase64,
-      ]);
-      const imagesArg = images.length > 0 ? images : undefined;
+      const imagesArg = jcodeImages(input.images);
 
       // The reconcile FLOOR: a `get_history` issued right after each send,
       // captured by INDEX at our spawn — everything a wake turn appended
@@ -1240,7 +1514,10 @@ class JcodeSession implements HarnessSession {
       // failed read costs only the index anchor: reconcile then degrades to
       // the content anchor. Sequential retries through SDK timeouts, no
       // delay; any other failure leaves the floor null after one attempt.
+      // Only the history reconcile needs a floor: on the live pickup path
+      // the read would be a daemon round trip for nothing.
       const readBaseline = () => {
+        if (this.liveSteers) return;
         void (async () => {
           for (;;) {
             if (baselineStopped || this.abortRequested) return;
@@ -1307,7 +1584,7 @@ class JcodeSession implements HarnessSession {
           terminal = { type: "turn.done" };
           break settle;
         }
-        const windowEnd = Date.now() + BUSY_DETECT_WINDOW_MS;
+        const windowEnd = Date.now() + BUSY_DETECT_WINDOW_MS.value;
         for (;;) {
           const entry = await nextEntry(windowEnd);
           // Window elapsed or stream gone: the held frames are ours; the
@@ -1358,7 +1635,7 @@ class JcodeSession implements HarnessSession {
               Date.now() +
               Math.max(
                 BUSY_RESEND_DELAYS_MS[healRound] ?? 0,
-                ORPHAN_DRAIN_MIN_MS,
+                ORPHAN_DRAIN_MIN_MS.value,
               );
             for (;;) {
               const drained = await nextEntry(drainEnd);
@@ -1425,6 +1702,14 @@ class JcodeSession implements HarnessSession {
       let lastFrameAt = Date.now();
       let abortSeenAt: number | undefined;
       let openToolCalls = 0;
+      // Tool-call ARGUMENTS, per call id. jcode streams them as
+      // `tool_input_delta` chunks between `tool_start` and `tool_exec`; they
+      // ride out on the call's `tool.finished` so a transcript can say what
+      // the agent asked for, not only what came back. Bounded here so a
+      // model writing a huge argument cannot grow this map without limit;
+      // the runner truncates again for the wire.
+      const toolInputs = new Map<string, { text: string; dropped: number }>();
+      let streamingToolId: string | undefined;
       while (!terminal) {
         if (this.abortRequested && abortSeenAt === undefined) {
           abortSeenAt = Date.now();
@@ -1498,9 +1783,60 @@ class JcodeSession implements HarnessSession {
           yield exclusionNotice();
         }
         switch (event.ev) {
-          case "text_delta":
+          case "text_delta": {
             progressed = true;
-            yield { type: "text.delta", text: event.text };
+            // The reply to a steered follow-up streams under THAT follow-up:
+            // the tracker says which one, as it reads the frame.
+            const replyTo = yield* this.observeSteerFrame({
+              kind: "text",
+              messageId: event.message_id,
+              text: event.text,
+            });
+            yield {
+              type: "text.delta",
+              text: event.text,
+              ...(event.message_id !== undefined && {
+                messageId: event.message_id,
+              }),
+              ...(replyTo !== undefined && { replyTo }),
+            };
+            break;
+          }
+          case "text_replace":
+            // A correction of text already streamed (a provider attempt
+            // rolled back and replayed, a repaired suffix). It names its
+            // message on every bridge that sends it; one that did not could
+            // not say which text to replace, so it is dropped.
+            if (event.message_id !== undefined) {
+              yield* this.observeSteerFrame({
+                kind: "replace",
+                messageId: event.message_id,
+                text: event.text,
+              });
+              yield {
+                type: "text.replace",
+                messageId: event.message_id,
+                text: event.text,
+              };
+            }
+            break;
+          case "text_done":
+            // The bridge's message frame closing (v0.86+). The answer tracker
+            // delimits messages by id on its own; only the live pickup path
+            // reads this, to close a reply the moment its message ends.
+            yield* this.observeSteerFrame({
+              kind: "text_done",
+              messageId: event.message_id,
+            });
+            break;
+          case "soft_interrupt_injected":
+            // The pickup signal (v0.94.0): the model now has these queued
+            // messages. Ours are confirmed joined right here, live; the
+            // reply is read from the frames that follow.
+            yield* this.observeSteerFrame({
+              kind: "injected",
+              clientIds: event.client_ids,
+            });
             break;
           case "reasoning_delta":
             progressed = true;
@@ -1509,22 +1845,57 @@ class JcodeSession implements HarnessSession {
           case "tool_start":
             progressed = true;
             openToolCalls += 1;
+            streamingToolId = event.call_id;
+            yield* this.observeSteerFrame({ kind: "tool_start" });
             yield {
               type: "tool.started",
               callId: event.call_id,
               name: event.name,
             };
             break;
-          case "tool_done":
+          case "tool_input_delta": {
+            // jcode before v0.88 sends `tool_input` WITHOUT a call id and
+            // the bridge forwards it as `call_id: ""`. Its own turn loop
+            // credits such a delta to the tool call currently streaming (the
+            // last `tool_start`), so do the same. v0.88+ keys every delta.
+            const callId = event.call_id || streamingToolId;
+            if (!callId) break;
+            const acc = toolInputs.get(callId) ?? {
+              text: "",
+              dropped: 0,
+            };
+            const room = TOOL_INPUT_MAX_CHARS - acc.text.length;
+            acc.text += event.delta.slice(0, Math.max(0, room));
+            acc.dropped += Math.max(0, event.delta.length - Math.max(0, room));
+            toolInputs.set(callId, acc);
+            break;
+          }
+          case "tool_done": {
             openToolCalls = Math.max(0, openToolCalls - 1);
+            const acc = toolInputs.get(event.call_id);
+            toolInputs.delete(event.call_id);
+            // Cut visibly, like the runner does for every other string: a
+            // reader must not mistake a partial SQL statement for the whole.
+            const input = acc?.text
+              ? acc.dropped > 0
+                ? `${acc.text}\n… [truncated ${acc.dropped} characters]`
+                : acc.text
+              : undefined;
+            const { output, exitCode } = readJcodeToolOutput(
+              event.name,
+              event.output,
+            );
             yield {
               type: "tool.finished",
               callId: event.call_id,
               name: event.name,
-              output: event.output,
+              ...(input ? { input } : {}),
+              output,
               ...(event.error ? { isError: true } : {}),
+              ...(exitCode !== undefined && { exitCode }),
             };
             break;
+          }
           case "token_usage":
             usage = usageFromEvent(event);
             break;
@@ -1595,11 +1966,12 @@ class JcodeSession implements HarnessSession {
       }
 
       // ONE exit point: whatever ended the turn, confirm which steers made
-      // it in and say so BEFORE the terminal event (the supervisor stops
-      // listening after it).
-      for (const followUpId of await this.reconcileSteers(input.message)) {
-        yield { type: "message.joined", followUpId };
-      }
+      // it in, with what the agent said back to each, and say so BEFORE the
+      // terminal event (the supervisor stops listening after it). On the
+      // live path the run already said so as each injection landed; the
+      // terminal closes a reply still being read, and anything the daemon
+      // never confirmed is missed.
+      yield* await this.settleTurnSteers(input.message);
       yield terminal;
     } finally {
       baselineStopped = true;
@@ -1621,30 +1993,129 @@ class JcodeSession implements HarnessSession {
    * which is exactly this session, because every conversation owns its own
    * connection (concurrent conversations steer first-class now; the old
    * shared-connection degrade to promotion is gone).
+   *
+   * The follow-up's images ride the same request (jcode injects them with
+   * the words as one user message). It is tagged with the follow-up's own
+   * id when the daemon echoes ids back (the live pickup signal), and sent
+   * untagged otherwise, for the turn-end history reconcile.
    */
   async steer(input: SteerInput): Promise<void> {
     if (!this.turnActive) {
       throw new Error("no turn in flight");
     }
-    await this.client.softInterrupt(this.sessionRef, input.message, false);
-    this.pendingSteers.push(input);
+    const images = jcodeImages(input.images);
+    await this.client.softInterruptWithId(this.sessionRef, input.message, {
+      ...(this.liveSteers && { clientId: input.id }),
+      ...(images && { images }),
+    });
+    if (this.liveSteers) this.liveSteers.sent(input);
+    else this.pendingSteers.push(input);
   }
 
   /**
-   * The turn ended — settle every steer it was handed. `cancelSoftInterrupts`
-   * first: after it, nothing more can inject (jcode's injection points exist
-   * only inside the turn loop), so the history read is stable. Then the pure
-   * matcher above, over user entries AFTER this turn's own prompt. Any
-   * failure degrades every pending steer to missed — the control plane
-   * re-runs the message as its own turn, and a possible duplicate beats a
-   * lost word.
+   * SEND NOW: move the tool the live turn is waiting on to the background
+   * (jcode's own "background this tool" control, the one its interactive
+   * client binds to a key). The tool keeps running under jcode's background
+   * registry, the model is told where to collect it, and the run reaches its
+   * next safe point now, injecting the queued steers.
+   *
+   * Asked only of a daemon that REPORTS what it moved (`background_tool_result`,
+   * v0.94.0+). An older daemon answers a bare ack whether or not a tool
+   * moved, which the SDK can only read as `moved: false`; acting on it would
+   * then cut a tool short while telling the person nothing moved. So an
+   * older daemon is not asked at all, and the answer is the honest
+   * `moved: false`. Scoped to this session by construction: the request
+   * names it, and the bridge only serves the connection's attached session.
    */
-  private async reconcileSteers(prompt: string): Promise<string[]> {
-    const pending = this.pendingSteers.splice(0);
+  async backgroundRunningTool(): Promise<BackgroundedTool> {
+    if (
+      !this.turnActive ||
+      !this.client.supports(BACKGROUND_TOOL_RESULT_CAPABILITY)
+    ) {
+      return { moved: false };
+    }
+    const result = await this.client.backgroundToolResult(this.sessionRef);
+    return result.moved
+      ? {
+          moved: true,
+          ...(result.toolName !== undefined && { toolName: result.toolName }),
+        }
+      : { moved: false };
+  }
+
+  /**
+   * The live pickup path's reader: one daemon frame in, the joins and
+   * finished replies it completed out, plus the follow-up a text frame is
+   * the reply to (so the caller tags the delta it yields next). A no-op
+   * without the capability, so the live loop feeds every frame
+   * unconditionally and stays free of path checks.
+   */
+  private *observeSteerFrame(
+    frame: SteerFrame,
+  ): Generator<HarnessEvent, string | undefined> {
+    if (!this.liveSteers) return undefined;
+    const { events, replyTo } = this.liveSteers.observe(frame);
+    yield* events;
+    return replyTo;
+  }
+
+  /**
+   * The turn ended: settle every steer it was handed, as the events still
+   * owed (a join always precedes its reply). `cancelSoftInterrupts` first:
+   * after it, nothing more can inject (jcode's injection points exist only
+   * inside the turn loop), so what follows is stable.
+   *
+   * Live path: every join was yielded as its injection landed; the terminal
+   * closes a reply still being read, and every steer the daemon never
+   * confirmed is missed (the control plane re-runs it as its own turn). No
+   * history read at all.
+   *
+   * History path (no `soft_interrupt_ids`): the pure `settleSteers` over
+   * this turn's window of the history, which steers landed and what the
+   * agent said back to each. Any failure degrades every pending steer to
+   * missed: a possible duplicate beats a lost word.
+   */
+  private async settleTurnSteers(prompt: string): Promise<SteerEvent[]> {
     this.turnActive = false;
     try {
       await this.client.cancelSoftInterrupts(this.sessionRef);
-      if (pending.length === 0) return [];
+    } catch (error) {
+      log("warn", "steer reconcile failed; reporting all missed", {
+        error: String(error),
+      });
+      this.pendingSteers = [];
+      return [];
+    }
+    if (this.liveSteers) {
+      const live = this.liveSteers;
+      this.liveSteers = null;
+      const closed = live.observe({ kind: "terminal" }).events;
+      const missed = live.unconfirmed();
+      if (missed.length > 0) {
+        log("info", "steers the run never confirmed; promotion will run them", {
+          sessionRef: this.sessionRef,
+          followUpIds: missed.map((steer) => steer.id),
+        });
+      }
+      return closed;
+    }
+    return (await this.reconcileFromHistory(prompt)).flatMap(
+      ({ followUpId, reply }): SteerEvent[] => [
+        { type: "message.joined", followUpId },
+        ...(reply !== undefined
+          ? [{ type: "message.replied" as const, followUpId, reply }]
+          : []),
+      ],
+    );
+  }
+
+  /** The history reconcile: the pickup path for a daemon without ids. */
+  private async reconcileFromHistory(
+    prompt: string,
+  ): Promise<{ followUpId: string; reply?: string }[]> {
+    const pending = this.pendingSteers.splice(0);
+    if (pending.length === 0) return [];
+    try {
       const history = await this.client.getHistory(this.sessionRef);
 
       // The window floor. Preferred anchor: the INDEX captured right after
@@ -1676,11 +2147,7 @@ class JcodeSession implements HarnessSession {
         if (floor === -1) return [];
       }
 
-      const candidates = history
-        .slice(floor)
-        .filter((entry) => entry.role === "user")
-        .map((entry) => entry.content);
-      return matchJoinedSteers(pending, candidates);
+      return settleSteers(pending, history, floor);
     } catch (error) {
       log("warn", "steer reconcile failed; reporting all missed", {
         error: String(error),
@@ -1796,9 +2263,10 @@ export const createJcodeHarness = (): Harness => {
     // skill stashes do not survive a boot — platform memory and the synced
     // skills root are the only durable knowledge.
     cleanJcodeKnowledgeStores(homeDir, jcodeHome);
-    // The transcript half: a stop that tore the daemon's last checkpoint
-    // left every journaled message doubled, which the provider rejects on
-    // every turn (#1194). Repaired here, while no daemon holds the store.
+    // The transcript half: a stored conversation the provider rejects on
+    // every turn (a stop that tore the daemon's last checkpoint and doubled
+    // its messages, #1194; an image in a format the provider refuses) is
+    // repaired here, while no daemon holds the store.
     healJcodeTranscripts(jcodeHome);
     writeManagedFile(join(jcodeHome, "config.toml"), managedConfigToml, 0o600);
     preparePromptFiles(homeDir, jcodeHome);
@@ -1809,13 +2277,12 @@ export const createJcodeHarness = (): Harness => {
     logForwarder ??= startJcodeLogForwarder({ jcodeHome });
 
     // OAuth-mode grants ship CLAUDE_CODE_OAUTH_TOKEN (a placeholder — the
-    // gateway splices the real token); steer jcode onto its subscription
-    // path for that case. Api-key mode needs no steering.
-    const oauthMode =
-      Boolean(process.env.CLAUDE_CODE_OAUTH_TOKEN) &&
-      !process.env.ANTHROPIC_API_KEY;
+    // gateway splices the real token), API-key grants ANTHROPIC_API_KEY;
+    // either way the credential ROUTE is pinned below, never left to the
+    // runtime's automatic mode. See resolveAnthropicCredential.
+    const anthropic = resolveAnthropicCredential(process.env);
 
-    if (oauthMode) {
+    if (anthropic.oauthStub) {
       // Seed jcode's OWN auth store with a never-expiring placeholder
       // account (live-verified: a bare env token is marked expired and the
       // runtime refuses it at request time — "only useful while still
@@ -1847,6 +2314,15 @@ export const createJcodeHarness = (): Harness => {
         })}\n`,
         0o600,
       );
+    } else {
+      // No OAuth grant on THIS boot, but the home is durable: a stub an
+      // earlier OAuth grant wrote is still here, and the runtime would load
+      // it as a live account beside the API key. Recursive so a directory
+      // planted at this path is healed rather than throwing EISDIR: a throw
+      // here would fail the launch, and the memoized instance makes that
+      // permanent for the container. `rmSync` unlinks a planted symlink
+      // rather than following it (the standing purge law above).
+      rmSync(join(jcodeHome, "auth.json"), { recursive: true, force: true });
     }
 
     const launched = await launchInstance({
@@ -1893,7 +2369,11 @@ export const createJcodeHarness = (): Harness => {
         // bypassing `StartSessionOptions` — so a caller passing a different
         // model would get a launch env and a session model that disagree.
         // `setModel` in `applyPreferences` is the single door.
-        ...(oauthMode ? { JCODE_PROVIDER: "claude" } : {}),
+        ...(anthropic.oauthStub ? { JCODE_PROVIDER: "claude" } : {}),
+        // The credential-route pin (see resolveAnthropicCredential). Read by
+        // every Anthropic runtime the daemon constructs, so a session
+        // resumed from either route lands on the route the grant names.
+        ...(anthropic.route ? { JCODE_RUNTIME_PROVIDER: anthropic.route } : {}),
       },
     });
 
@@ -2014,9 +2494,12 @@ export const createJcodeHarness = (): Harness => {
       resume: true,
       thinking: true,
       toolEvents: true,
-      // softInterrupt: a mid-run message joins the live turn at jcode's own
-      // safe points — the same primitive its interactive composer uses.
+      // soft_interrupt: a mid-run message (and its images) joins the live
+      // turn at jcode's own safe points, the primitive its composer uses.
       steer: true,
+      // background_tool: SEND NOW moves the running tool aside so a queued
+      // steer is read now (asked only of a daemon that reports the move).
+      backgroundTool: true,
       skillsDir: ".agents/skills",
       instructionFiles: ["CLAUDE.md", "AGENTS.md"],
       // Connects to the platform-tools bridge at session start, and

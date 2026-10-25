@@ -9,9 +9,26 @@ import { CHANNEL_PROVIDER_IDS } from "../services/channels/types";
  */
 
 /**
+ * An EVAL run's conversation: the eval worker asks one test question on a
+ * fresh, non-direct conversation it owns, one per question per run.
+ *
+ * PLATFORM-ONLY, like the greeting: it is a stored conversation source, but
+ * `createConversationSchema` excludes it, so no client can mint an "eval"
+ * conversation and pass its own turns off as test runs.
+ *
+ * Deliberately NOT an automation source: an eval turn is a foreground ask
+ * the user clicked for and is waiting on (due-work must not rank it behind
+ * crons), and its answer must never be relayed into anyone's direct thread
+ * by the continuity bridge. It is never linked to a channel, so no mirror
+ * sees it, and chat lists do not show it (the web renders only the direct
+ * thread); the Runs view reads it by source.
+ */
+export const EVAL_SOURCE = "eval";
+
+/**
  * Where a conversation comes from. `web` is a person in the dashboard; the
  * rest arrive with their own steps (channels §3.16, crons step 7, watches
- * step 10, agent-to-agent PR 5b). Channel ingestion stamps
+ * step 10, agent-to-agent PR 5b, evals). Channel ingestion stamps
  * `source: presence.provider`, so the provider ids ARE sources — composed
  * from the one provider list, a new provider cannot forget this union.
  * `agent` is a peer OneCLI agent: the conversation's `externalRef` is the
@@ -22,7 +39,10 @@ export const CONVERSATION_SOURCES = [
   ...CHANNEL_PROVIDER_IDS,
   "cron",
   "watch",
+  // An inbound webhook's own conversation (externalRef = the webhook id).
+  "webhook",
   "agent",
+  EVAL_SOURCE,
 ] as const;
 export type ConversationSource = (typeof CONVERSATION_SOURCES)[number];
 
@@ -53,6 +73,7 @@ export const PEER_TASK_SOURCE = "peer_task";
 export const AUTOMATION_SOURCES = [
   "cron",
   "watch",
+  "webhook",
   PEER_TASK_SOURCE,
 ] as const satisfies readonly TurnSource[];
 export type AutomationSource = (typeof AUTOMATION_SOURCES)[number];
@@ -79,18 +100,52 @@ export type AutomationSource = (typeof AUTOMATION_SOURCES)[number];
  *     reply, which a first-contact greeting has no use for.
  *
  * What the greeting DOES share with an automation is its render shape: no
- * user typed it, so it wears no user bubble and gets no "(from the web)"
+ * user typed it, so it wears no user bubble and gets no web
  * attribution. That is `isPlatformAuthoredSource` below, which is what the
  * render paths test — never `AUTOMATION_SOURCES`.
  */
 export const GREETING_SOURCE = "greeting";
 
+/**
+ * The platform resuming an agent after a person finished a desktop step:
+ * "Alex took control of your desktop and is done. Continue." Posted with
+ * no user, into the thread the agent asked from. The greeting's twin in every respect that matters: a TURN source
+ * only (no client may mint a "desktop" conversation), platform-authored
+ * (no user bubble, no "(from the web)"), and FOREGROUND, so it never ranks
+ * behind the automation cohort and never relays into the next human turn
+ * as an automation delivery. The one difference is the thread: the
+ * greeting runs on a brand-new direct thread, this one wherever the ask
+ * came from, through the direct-wake door for a direct thread.
+ */
+export const DESKTOP_RESUME_SOURCE = "desktop";
+
 /** Every source a TURN may carry: conversation sources plus the turn-only
- * ones (the greeting, a peer task's report). */
+ * ones (the greeting, a desktop resume, a peer task's report). */
 export type TurnSource =
   | ConversationSource
   | typeof GREETING_SOURCE
+  | typeof DESKTOP_RESUME_SOURCE
   | typeof PEER_TASK_SOURCE;
+
+/**
+ * A turn or follow-up born from an automation rather than a person typing.
+ * The one predicate over `AUTOMATION_SOURCES`, shared by every surface that
+ * asks the question (the continuity bridge, the channel mirror, the steer
+ * arm's framing), so a new automation source is still ONE edit.
+ */
+export const isAutomationSource = (
+  source: string,
+): source is AutomationSource =>
+  (AUTOMATION_SOURCES as readonly string[]).includes(source);
+
+/** The sources whose turn message nobody typed: the greeting, a desktop
+ * resume, and every automation. One list, so a query can fence on the same
+ * set the predicate below tests. */
+export const PLATFORM_AUTHORED_SOURCES = [
+  GREETING_SOURCE,
+  DESKTOP_RESUME_SOURCE,
+  ...AUTOMATION_SOURCES,
+] as const satisfies readonly TurnSource[];
 
 /**
  * Nobody typed this turn's message — the platform authored it (an automation
@@ -99,8 +154,7 @@ export type TurnSource =
  * a user bubble", which is about authorship, not about scheduling priority.
  */
 export const isPlatformAuthoredSource = (source: string): boolean =>
-  source === GREETING_SOURCE ||
-  (AUTOMATION_SOURCES as readonly string[]).includes(source);
+  PLATFORM_AUTHORED_SOURCES.some((authored) => authored === source);
 
 /** A turn's lifecycle. The first three are the ACTIVE set the partial unique
  * index fences — at most one of them per conversation. `joining`/`joined` are
@@ -177,6 +231,7 @@ export const LIFECYCLE_TURN_ERROR_CODES = [
   "harness_busy",
   "harness_no_terminal",
   "image_unavailable",
+  "model_endpoint_not_found",
   "transcript_rejected",
   "turn_stalled",
   "turn_time_limit",
@@ -248,6 +303,22 @@ export const TURN_STALLED_MESSAGE =
 export const TURN_CEILING_WARNING_MESSAGE =
   "[system] This turn is approaching its time limit and will be ended soon. Stop starting new work and stop waiting on long-running things now. Reply with: what you completed, the current status of anything still running (background processes, CI, other agents — they keep running after this turn ends), what remains, and how to continue in the next message. Then end the turn.";
 
+/**
+ * The delivery-only frame a mid-run follow-up from a person (or a peer agent,
+ * whose text already names it as one) carries into the live run: the steer
+ * arm's `context`, prepended at the harness boundary like a turn's memory
+ * context, so the stored row keeps the sender's exact words. Without it the
+ * words land between tool results with nothing marking them as a new
+ * message, and the model folds them into the task instead of answering.
+ * Agent-facing: names what arrived and what to do, and leaves the HOW (short,
+ * direct, before any tool call) to the system prompt's rule. Sender-neutral
+ * on purpose, so it is never a lie about who wrote it. Automation follow-ups
+ * (a wake joining a running watch turn) and the ceiling warning carry their
+ * own header and never get this one.
+ */
+export const STEERED_FOLLOW_UP_CONTEXT =
+  "[A new message arrived while you were working. Reply to it directly in your next message, then continue the task.]";
+
 /** The host has no room right now; honest about the wait, silent about the
  * infrastructure. */
 export const AT_CAPACITY_MESSAGE =
@@ -293,14 +364,21 @@ export const HARNESS_NO_TERMINAL_MESSAGE =
 
 /** The model provider rejected the conversation itself as malformed. Its
  * stored history is replayed whole on every turn, so resending as-is fails
- * the same way. The known cause (#1194: a stop interrupted the agent mid
- * save and left its history duplicated) is repaired the next time the agent
- * starts, which an idle stop brings about on its own; any other cause needs
- * whoever operates the agent. The copy promises neither outcome: it says
- * the problem is the conversation's saved history, not the person's
- * message, and what to try. */
+ * the same way. Boot-time repair covers duplicated tool ids and unsupported
+ * images, but not rejected signed payloads. An explicit dashboard restart
+ * clears the saved session reference and starts fresh for every family.
+ * Name the dashboard because this copy also appears in shared channels. */
 export const TRANSCRIPT_REJECTED_MESSAGE =
-  "The agent couldn't continue because this conversation's saved history is damaged. It tries to repair it the next time it restarts, so send your message again in a little while. If this keeps happening, contact whoever operates this agent.";
+  "The agent couldn't continue because this conversation's saved history is damaged. To start it fresh, restart the agent from its menu in the dashboard, then send your message again. If this keeps happening, contact whoever operates this agent.";
+
+/** The model endpoint answered 404: an unknown model name, a wrong endpoint
+ * address, or a proxy in front of the provider forwarding to a path it does
+ * not serve. Setup, not the person's message and not the key, so the call to
+ * action is the operator. A resend helps only when a proxy misrouted a single
+ * call, so it comes second. Shown in shared channels too, so it names no
+ * internals. */
+export const MODEL_ENDPOINT_NOT_FOUND_MESSAGE =
+  'The agent couldn\'t reach its model: the model endpoint answered "not found". This is usually a setup problem with the model name or endpoint, not your message, so contact whoever operates this agent. Sending it again helps only if this was a one-time glitch.';
 
 /** The Slack mirror's last-resort line for a FAILED turn that produced no
  * answer text and no error anywhere — silence would read as the agent
@@ -318,6 +396,39 @@ export const TURN_FAILED_PARTIAL_MESSAGE =
  * the web's word for the same moment (turn-block's aborted arm), kept
  * byte-identical by convention. */
 export const TURN_STOPPED_MESSAGE = "Stopped.";
+
+/** Shown in place of an uncoded failure whose error text is a raw payload
+ * (see `isRawErrorPayload`). Nothing classified the failure, so the copy
+ * names no cause and no fix it cannot vouch for (never the model key: a
+ * provider 500 or a context overflow is not a key problem). Same doctrine as
+ * the family above: temporary in tone, and it says what to do next. */
+export const TURN_FAILED_RAW_ERROR_MESSAGE =
+  "The agent ran into an error and couldn't finish this message. Send it again in a moment. If it keeps happening, contact whoever operates this agent.";
+
+/**
+ * A provider's JSON error envelope (`"error": {…}`: Anthropic, OpenAI and
+ * Google all nest the error object under that key, and a body quoted inside
+ * another string escapes the quote as `\"error\": {`) or an HTML error page
+ * (a proxy's 502). Kept narrow on purpose:
+ * - The OneCLI gateway's own refusals use a FLAT string code
+ *   (`"error": "blocked_by_policy"`) beside a readable message that names
+ *   the rule or budget, so they keep today's passthrough.
+ * - Status phrases, "run this command" lines and tool names never match: an
+ *   ordinary error SENTENCE is the useful answer and must stay as written.
+ * No nested quantifiers: the text is untrusted and can be long.
+ */
+const RAW_ERROR_PAYLOAD = /"error\\?"\s*:\s*\{|<!doctype html|<html[\s>]/i;
+
+/**
+ * Whether an UNCODED failure's error text is a raw payload rather than a
+ * sentence. Coded failures never need this (the control plane already
+ * stored their canonical copy). The surfaces swap a payload for
+ * `TURN_FAILED_RAW_ERROR_MESSAGE`; the web keeps the raw text behind a
+ * collapsed disclosure for whoever is debugging, and a shared channel drops
+ * it.
+ */
+export const isRawErrorPayload = (error: string): boolean =>
+  RAW_ERROR_PAYLOAD.test(error);
 
 /**
  * The server-side allowlist: a WIRE failure code (supervisor/runner-supplied,
@@ -360,6 +471,10 @@ export const TURN_FAILURE_COPY: Partial<
     code: "transcript_rejected",
     message: TRANSCRIPT_REJECTED_MESSAGE,
   },
+  model_endpoint_not_found: {
+    code: "model_endpoint_not_found",
+    message: MODEL_ENDPOINT_NOT_FOUND_MESSAGE,
+  },
 };
 
 /** Generous but bounded — a turn's message crosses two hops and is stored. */
@@ -387,7 +502,8 @@ const noNulBytes = <T extends z.ZodType<string>>(schema: T) =>
 
 export const createConversationSchema = z.object({
   agentId: z.string().min(1),
-  source: z.enum(CONVERSATION_SOURCES).optional(),
+  // A client may create any stored source except the platform-only ones.
+  source: z.enum(CONVERSATION_SOURCES).exclude([EVAL_SOURCE]).optional(),
   externalRef: noNulBytes(z.string().trim().min(1).max(500)).optional(),
   title: noNulBytes(z.string().trim().min(1).max(200)).optional(),
 });

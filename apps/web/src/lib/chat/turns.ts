@@ -2,6 +2,7 @@ import {
   ACTIVE_TURN_STATUSES,
   AUTOMATION_SOURCES,
   UNSETTLED_TURN_STATUSES,
+  isAutomationSource,
   isPlatformAuthoredSource,
 } from "@onecli/api/validations/conversation";
 import type { Turn, TurnStatus } from "@/lib/api/types";
@@ -19,6 +20,10 @@ const UNSETTLED: readonly TurnStatus[] = UNSETTLED_TURN_STATUSES;
 
 export const isActiveTurn = (turn: Turn): boolean =>
   ACTIVE.includes(turn.status);
+
+/** The same test on a bare status string (a run's, read off the wire). */
+export const isActiveTurnStatus = (status: string): boolean =>
+  ACTIVE.some((active) => active === status);
 
 /** A mid-run follow-up riding the active turn (steering, or parked). */
 export const isJoiningTurn = (turn: Turn): boolean => turn.status === "joining";
@@ -62,7 +67,7 @@ export const isPlatformAuthoredTurn = (turn: Turn): boolean =>
 export const isAutomationTurn = (
   turn: Turn,
 ): turn is Turn & { source: AutomationSource } =>
-  (AUTOMATION_SOURCES as readonly string[]).includes(turn.source);
+  isAutomationSource(turn.source);
 
 /** The one in-flight turn, if any. `undefined` input reads as "none". */
 export const activeTurn = (turns: Turn[] | undefined): Turn | undefined =>

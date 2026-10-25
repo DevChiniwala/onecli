@@ -51,12 +51,15 @@ describe("channelsFragment", () => {
     expect(body).toContain("use send_message (below)");
   });
 
-  it("a live presence: carries the recipients teaching (find_recipient, @[Name], sent/held)", () => {
+  it("a live presence: carries the recipients teaching (find_recipient, @[Name], sent/held/not_sent)", () => {
     const body = flat(channelsFragment([live])!.body);
     expect(body).toContain("find_recipient");
     expect(body).toContain("@[app]");
     expect(body).toContain('"sent" = delivered. "held" =');
-    expect(body).toContain("never promise to follow up on your own");
+    expect(body).toContain("never promise to report the decision on your own");
+    expect(body).toContain('"not_sent" = an earlier message');
+    expect(body).toContain("pass the answer on yourself with send_message");
+    expect(body).toContain("Never ask anyone to check back later");
   });
 
   it("a live presence: the platform's formatting sentence rides along", () => {
@@ -159,5 +162,35 @@ describe("channelsTools", () => {
       required: ["query"],
       properties: { kind: { enum: ["person", "channel"] } },
     });
+  });
+
+  it("read_conversation is listed (and taught) ONLY while someone shared a conversation", () => {
+    expect(channelsTools([live]).map((t) => t.name)).not.toContain(
+      "read_conversation",
+    );
+    expect(
+      channelsTools([{ ...live, readableConversations: 0 }]).map((t) => t.name),
+    ).not.toContain("read_conversation");
+    const withGrants = { ...live, readableConversations: 2 };
+    const tools = channelsTools([withGrants]);
+    expect(tools.map((t) => t.name)).toContain("read_conversation");
+    // Nothing required: with no conversation the tool lists what the asker
+    // may read, so a model never dead-ends on a missing argument.
+    expect(
+      tools.find((t) => t.name === "read_conversation")!.inputSchema,
+    ).toMatchObject({ required: [] });
+    expect(flat(channelsFragment([withGrants])!.body)).toContain(
+      "Call it with no arguments to see which conversations you may read here",
+    );
+    expect(flat(channelsFragment([withGrants])!.body)).toContain(
+      "never guess what was said in it",
+    );
+    expect(flat(channelsFragment([live])!.body)).not.toContain(
+      "read_conversation",
+    );
+    // A removed presence lists no tools at all, grants or not.
+    expect(channelsTools([{ ...removed, readableConversations: 3 }])).toEqual(
+      [],
+    );
   });
 });

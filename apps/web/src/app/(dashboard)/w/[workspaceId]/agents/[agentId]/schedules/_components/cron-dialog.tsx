@@ -24,6 +24,7 @@ import {
 import { Textarea } from "@onecli/ui/components/textarea";
 import { useCreateCron, useDeleteCron, useUpdateCron } from "@/hooks/use-crons";
 import type { AgentCron } from "@/lib/api";
+import { browserTimezone } from "@/lib/agents/schedule-timezone";
 
 /**
  * Create/edit a schedule. No date libraries exist in this app, deliberately —
@@ -51,9 +52,6 @@ const timeOf = (schedule: string): string => {
   if (!daily) return "09:00";
   return `${daily[2]!.padStart(2, "0")}:${daily[1]!.padStart(2, "0")}`;
 };
-
-const browserTimezone = (): string =>
-  Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
 export interface CronDialogProps {
   agentId: string;
@@ -126,7 +124,8 @@ export const CronDialog = ({
     return `${Number.parseInt(match[2]!, 10)} ${Number.parseInt(match[1]!, 10)} * * *`;
   };
 
-  const busy = create.isPending || update.isPending || remove.isPending;
+  // A save holds the dialog (the server validates it); a delete is instant.
+  const busy = create.isPending || update.isPending;
 
   const submit = () => {
     const expression = schedule();
@@ -292,16 +291,12 @@ export const CronDialog = ({
               variant="ghost"
               className="text-destructive hover:text-destructive"
               disabled={busy}
-              loading={remove.isPending}
-              onClick={() =>
-                remove.mutate(editing.id, {
-                  onSuccess: () => {
-                    toast.success("Schedule deleted");
-                    onOpenChange(false);
-                  },
-                  onError: (error) => toast.error(String(error.message)),
-                })
-              }
+              // Instant: the row leaves the list and the dialog closes on
+              // click; the hook confirms, or puts the row back and says why.
+              onClick={() => {
+                remove.mutate(editing.id);
+                onOpenChange(false);
+              }}
             >
               Delete
             </Button>

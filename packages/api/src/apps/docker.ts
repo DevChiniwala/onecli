@@ -65,7 +65,9 @@ const exchangeCredentials = async (
 
 export const docker: AppDefinition = {
   id: "docker",
+  setupGuideUrl: "https://onecli.sh/docs/integrations/docker",
   name: "Docker Hub",
+  apiDocsUrl: "https://docs.docker.com/reference/api/hub/latest/",
   icon: "/icons/docker.svg",
   darkIcon: "/icons/docker-light.svg",
   description:
