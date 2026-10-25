@@ -18,3 +18,9 @@ apps/sandbox-home-device/target/
 
 # Generated gRPC client (buf + protoc-gen-es output, gitignored).
 packages/sandbox-home-device-proto/src/gen/
+
+# Agent instruction files may be symlinks, which prettier refuses by name.
+AGENTS.md
+
+# Helm templates are Go templates, not YAML; prettier would mangle the actions.
+charts/**/templates/

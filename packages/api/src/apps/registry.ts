@@ -59,10 +59,20 @@ import { clay } from "./clay";
 import { x } from "./x";
 import { fathom } from "./fathom";
 import { fireflies } from "./fireflies";
+import { timeless } from "./timeless";
+import { circleback } from "./circleback";
 import { zohoCrm } from "./zoho-crm";
 import { snowflake } from "./snowflake";
 import { stripe } from "./stripe";
+import { navan } from "./navan";
 import { salesforce } from "./salesforce";
+import { pylon } from "./pylon";
+import { pagerduty } from "./pagerduty";
+import { coralogix } from "./coralogix";
+import { onyx } from "./onyx";
+import { twilio } from "./twilio";
+import { dripify } from "./dripify";
+import { webflow } from "./webflow";
 
 const staticApps: AppDefinition[] = [
   salesforce,
@@ -123,9 +133,19 @@ const staticApps: AppDefinition[] = [
   x,
   fathom,
   fireflies,
+  timeless,
+  circleback,
   zohoCrm,
   snowflake,
   stripe,
+  navan,
+  pylon,
+  pagerduty,
+  coralogix,
+  onyx,
+  twilio,
+  dripify,
+  webflow,
 ];
 
 export const getApps = (): AppDefinition[] => [...staticApps];

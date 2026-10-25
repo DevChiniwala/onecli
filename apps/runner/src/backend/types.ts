@@ -36,7 +36,8 @@ export class ImageUnavailableError extends Error {
  * `reasonCode: "at_capacity"` — the control plane's honest "too many agents
  * are running right now" copy — without knowing any substrate's error
  * shapes. On the cloud backend this carries the remote service's 422
- * `workspace_quota_exceeded` (its per-workspace capacity limit).
+ * `workspace_quota_exceeded` (its per-workspace capacity limit), which
+ * only the wake (the one call that allocates a home) can hit.
  */
 export class SandboxCapacityError extends Error {
   constructor(detail: string) {
@@ -86,6 +87,15 @@ export interface SandboxSpec {
    * "credentials changed, recreate it".
    */
   payloadHash: string;
+  /**
+   * Whether the runner that spawned this sandbox hands out supervisor
+   * sessions (the resumable channel). Persisted ON the container, because
+   * the fact outlives the process: a restarted runner must grant the
+   * resume grace only to a sandbox whose supervisor can actually hold a
+   * session. One spawned by a keyless runner is retrying a token that died
+   * with that process, and waiting for it only delays the old recovery.
+   */
+  resumable: boolean;
 }
 
 /** What the backend currently holds for a sandbox — the reconcile input. */
@@ -94,6 +104,9 @@ export interface SandboxSnapshot {
   containerRef: ContainerRef;
   running: boolean;
   payloadHash: string | null;
+  /** The spawn-time `SandboxSpec.resumable` mark; false when the container
+   * predates it (spawned by a pre-feature runner) or the substrate lost it. */
+  resumable: boolean;
   /**
    * The substrate's own lifecycle phase, when it has one (an orchestrator's
    * pod phase). Absent/null on substrates without the concept — consumers must
@@ -154,6 +167,19 @@ export interface SandboxBackend {
   identify(runnerId: string): void;
 
   // ── Homes (the §3.9 seam) ────────────────────────────────────────
+  /**
+   * The ref of a sandbox's home: a pure function of the id, with no I/O,
+   * and always exactly what `provisionHome` returns for that id. Every
+   * per-sandbox home operation addresses the home by this name, never by
+   * enumerating homes, whose cost grows with the fleet. `listHomes` is for
+   * reconcile's reap alone.
+   */
+  homeRefFor(sandboxId: string): HomeRef;
+  /**
+   * Ensure the sandbox's home exists and return its ref. An IDEMPOTENT
+   * ensure: provisioning an existing home returns that same home, untouched.
+   * The start path relies on this to resolve the home in one call.
+   */
   provisionHome(sandboxId: string): Promise<HomeRef>;
   destroyHome(ref: HomeRef): Promise<void>;
   /** No-ops on `resident` backends; archive/restore on `snapshot` ones. */

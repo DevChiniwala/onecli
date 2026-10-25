@@ -44,8 +44,9 @@ const USER = `${P}user`;
 beforeAll(async () => {
   if (!PROOF_URL) return;
   process.env.DATABASE_URL = PROOF_URL;
-  // Pinned per-suite: process.env leaks across worker files, and CI's ambient
-  // NEXT_PUBLIC_EDITION is cloud — these assertions are flat-team semantics.
+  // Pinned per-suite: each file starts from the lane's edition (the hermetic
+  // setup resets env per file), and CI's cloud lane carries
+  // NEXT_PUBLIC_EDITION=cloud. These assertions are flat-team semantics.
   process.env.EDITION = "onprem";
   process.env.NEXT_PUBLIC_EDITION = "onprem";
   // The sweep-settle test ages a run against THIS value, not the prod default.
@@ -437,7 +438,10 @@ describe.skipIf(!PROOF_URL)("one-shot schedules", () => {
     });
     const cronService = await import("./agent-cron-service");
     await expect(
-      cronService.runCronNow(WORKSPACE, agentId, cron.id),
+      cronService.runCronNow(WORKSPACE, agentId, cron.id, {
+        userId: USER,
+        organizationId: ORG,
+      }),
     ).rejects.toThrow(/already ran to completion/);
   });
 });
@@ -927,6 +931,11 @@ describe.skipIf(!PROOF_URL)("settling and delivery", () => {
         status: "done",
         source: "watch",
         userId: null,
+        // A second in the past: `created_at` is millisecond-precision and
+        // the bridge window is strictly `createdAt < before`, so a wake
+        // inserted in the same millisecond as the person's next turn falls
+        // outside it and the report vanishes from the context (flaked here).
+        createdAt: new Date(Date.now() - 1000),
         startedAt: new Date(),
         finishedAt: new Date(),
       },

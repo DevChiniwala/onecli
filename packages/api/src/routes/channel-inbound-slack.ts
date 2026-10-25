@@ -1,15 +1,28 @@
 import { Hono } from "hono";
 import { db } from "@onecli/db";
-import { escapeSlackText } from "@onecli/channels/slack";
+import {
+  escapeSlackText,
+  followUpActionClickOf,
+  groupClickOf,
+  turnStopClickOf,
+} from "@onecli/channels/slack";
 import type { ApiEnv } from "../types";
 import { getCrypto } from "../providers";
 import { configuredAppUrl } from "../lib/app-origin";
 import { ServiceError } from "../services/errors";
 import { verifySlackSignature } from "../services/channels/providers/slack/signature";
 import { dispatchSlackEvent } from "../services/channels/providers/slack/dispatch";
+import {
+  actOnCardFollowUp,
+  stopFromCard,
+} from "../services/channels/channel-ingestion-service";
 import { interpretSlackEvent } from "../services/channels/providers/slack/interpret";
 import { sharedSlackApp } from "../services/channels/providers/slack/shared-app";
-import { postBlocksMessage, postMessage } from "@onecli/channels/slack";
+import {
+  postBlocksMessage,
+  postEphemeral,
+  postMessage,
+} from "@onecli/channels/slack";
 import { parseSlackPresenceCredentials } from "../services/channels/providers/slack/types";
 import {
   getInboundPresence,
@@ -26,13 +39,21 @@ import {
   verifyMarketplaceInstallState,
 } from "../services/channels/providers/slack/shared-install-service";
 import { onboardingReplyForSlackUser } from "../services/channels/providers/slack/onboarding-service";
-import { decideApprovalFromChannel } from "../services/channels/channel-approval-service";
+import {
+  decideApprovalFromChannel,
+  decideApprovalsFromChannel,
+  type ChannelGroupDecisionResult,
+} from "../services/channels/channel-approval-service";
 import { decideReachFromChannel } from "../services/channels/agent-reach-service";
 import { REACH_ACTION_DECISIONS } from "../services/channels/providers/slack/reach-card";
 import { decideActionApprovalFromChannel } from "../services/channels/action-approval-service";
-import { ACTION_APPROVAL_DECISIONS } from "../services/channels/providers/slack/action-approval-card";
+import { getUserReadConnectCompleter } from "../providers/hooks/conversation-reader";
+import {
+  ACTION_APPROVAL_DECISIONS,
+  settledActionCardText,
+} from "../services/channels/providers/slack/action-approval-card";
 import { agentImageUrlOrNull } from "../services/agent-image-service";
-import { publicApiUrl } from "../services/channels/posture";
+import { oauthCallbackUrl, publicApiUrl } from "../services/channels/posture";
 import { logger } from "../lib/logger";
 
 const log = logger.child({ component: "slack-inbound" });
@@ -201,14 +222,76 @@ const readCappedBody = async (raw: Request): Promise<string | null> => {
   return body;
 };
 
+const inFlightReplies = new Set<Promise<unknown>>();
+
 /** Fire a Slack reply without blocking the webhook ack — Slack's 3s window is
  * tight, and a slow post must not delay the 200 (nor 500 it: a 500 makes Slack
  * retry a request we already processed). Errors are swallowed and logged. */
 const fireReply = (fn: () => Promise<unknown>): void => {
-  void fn().catch((err: unknown) =>
-    log.warn({ err }, "slack reply post failed"),
+  const settled = fn()
+    .catch((err: unknown) => log.warn({ err }, "slack reply post failed"))
+    .finally(() => inFlightReplies.delete(settled));
+  inFlightReplies.add(settled);
+};
+
+/**
+ * Tell the clicker alone, without touching the message they clicked: a
+ * private (ephemeral) note through the click's own `response_url`. The
+ * shared card stays exactly as everyone else sees it. Detached like every
+ * reply here, and silent when the click carried no usable url (nothing to
+ * answer through is not an error).
+ */
+const tellClicker = (
+  responseUrl: string | undefined,
+  message: string,
+): void => {
+  if (!responseUrl || !isSlackResponseUrl(responseUrl)) return;
+  const text = escapeSlackText(message);
+  fireReply(() =>
+    fetch(responseUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        replace_original: false,
+        response_type: "ephemeral",
+        text,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    }),
   );
 };
+
+/** Test seam: resolve once every detached reply fired so far (and any it
+ * fires in turn) has settled, so a suite can assert exactly what was posted
+ * without guessing a sleep. Never called by production code. */
+export const settleDetachedRepliesForTests = async (): Promise<void> => {
+  while (inFlightReplies.size > 0) {
+    await Promise.allSettled([...inFlightReplies]);
+  }
+};
+
+/** A grouped click's outcome, for the clicker: "✅ 3 approved by Ada ·
+ * 1 already decided · 1 couldn't be decided, try again". A click that
+ * decided nothing (all of it was decided elsewhere first, e.g. on the web)
+ * says just that, never "⛔ 0 denied by Ada". */
+const groupDecisionText = (
+  decision: "approve" | "deny",
+  outcome: Extract<ChannelGroupDecisionResult, { kind: "decided" }>,
+): string =>
+  [
+    outcome.decided.length > 0 &&
+      `${decision === "approve" ? "✅" : "⛔"} ${outcome.decided.length} ${
+        decision === "approve" ? "approved" : "denied"
+      } by ${escapeSlackText(outcome.decidedByName)}`,
+    outcome.alreadySettled.length > 0 &&
+      (outcome.decided.length > 0
+        ? `${outcome.alreadySettled.length} already decided`
+        : `☑️ ${outcome.alreadySettled.length === 1 ? "It was" : `All ${outcome.alreadySettled.length} were`} already decided`),
+    outcome.failed.length > 0 &&
+      `${outcome.failed.length} couldn't be decided, try again`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
 /** Slack's documented `response_url` host. Anything else is an SSRF attempt —
  * the interactivity payload is signed with a secret the attacher knows. */
@@ -601,6 +684,21 @@ export const channelInboundSlackRoutes = () => {
             ...(iconUrl && { iconUrl }),
           }),
         );
+      } else if (result.kind === "stop" && result.outcome.kind === "refused") {
+        // A refused Stop is the clicker's business alone: a private note in
+        // the thread they clicked in. The loader stays (the agent IS still
+        // working); an authorized stop owes nothing here (its close posts
+        // "Stopped." to everyone).
+        const { channel, threadTs, externalUserId } = result.call;
+        const message = result.outcome.message;
+        fireReply(() =>
+          postEphemeral(botToken, {
+            channel,
+            threadTs,
+            user: externalUserId,
+            text: escapeSlackText(message),
+          }),
+        );
       }
     }
 
@@ -620,7 +718,11 @@ export const channelInboundSlackRoutes = () => {
       type?: string;
       api_app_id?: string;
       user?: { id?: string };
-      actions?: { action_id?: string; value?: string }[];
+      actions?: {
+        action_id?: string;
+        value?: string;
+        selected_option?: { value?: string };
+      }[];
       response_url?: string;
     };
     try {
@@ -730,11 +832,13 @@ export const channelInboundSlackRoutes = () => {
         const responseUrl = payload.response_url;
         const text =
           outcome.kind === "decided"
-            ? outcome.status === "executed"
-              ? "✅ Approved and done."
-              : outcome.status === "rejected"
-                ? "⛔ Rejected."
-                : "⚠️ Approved, but it failed - the agent was told."
+            ? // The clicked card reads exactly like every other settled
+              // card: WHAT was decided and by whom.
+              settledActionCardText({
+                summary: outcome.summary,
+                outcome: outcome.status,
+                decidedByName: outcome.decidedByName,
+              })
             : outcome.kind === "already_settled"
               ? "This request was already decided."
               : escapeSlackText(outcome.message);
@@ -756,6 +860,94 @@ export const channelInboundSlackRoutes = () => {
           }),
         );
       }
+      return c.json({ ok: true });
+    }
+
+    // The narration card's own Stop (where no native loader stands). The
+    // click names the card only by where Slack says it sits (the container:
+    // channel + the card message's ts), never by the button's value, so it
+    // can reach nothing but the turn whose live card that is on THIS app.
+    // A refusal answers the clicker alone, ephemerally; an authorized stop
+    // owes nothing here (the close replaces the card with "Stopped.").
+    const cardStop = turnStopClickOf(payload);
+    if (cardStop) {
+      const outcome = await stopFromCard({
+        agentChannelId: presence.id,
+        externalUserId: cardStop.clickerExternalUserId,
+        channel: cardStop.channel,
+        cardTs: cardStop.messageTs,
+      });
+      if (outcome.kind === "refused") {
+        tellClicker(payload.response_url, outcome.message);
+      }
+      return c.json({ ok: true });
+    }
+
+    // A control on a waiting message's row of the same card (Send now).
+    // The card is named the way Stop names it; the row's value says which
+    // message, and the service checks it against that card's own turn and
+    // the clicker against the message's author. Done owes nothing here (the
+    // row leaves the card when the agent reads the message); a refusal
+    // answers the clicker alone, ephemerally.
+    const rowAction = followUpActionClickOf(payload);
+    if (rowAction) {
+      const outcome = await actOnCardFollowUp({
+        agentChannelId: presence.id,
+        externalUserId: rowAction.clickerExternalUserId,
+        channel: rowAction.channel,
+        cardTs: rowAction.messageTs,
+        action: rowAction.action,
+        followUpId: rowAction.followUpId,
+      });
+      if (outcome.kind === "refused") {
+        tellClicker(payload.response_url, outcome.message);
+      }
+      return c.json({ ok: true });
+    }
+
+    // The GROUPED approval card's branch: Approve all / Deny all / one row.
+    // Every id is fenced to this presence's own posted cards service-side.
+    // Up to APPROVAL_GROUP_MAX_IDS gateway decides can outlast Slack's 3s
+    // ack, so the 200 goes first and the outcome rides response_url (good
+    // for 30 min).
+    const groupClick =
+      payload.type === "block_actions" && action ? groupClickOf(action) : null;
+    if (groupClick && clicker) {
+      const responseUrl =
+        payload.response_url && isSlackResponseUrl(payload.response_url)
+          ? payload.response_url
+          : null;
+      fireReply(async () => {
+        const outcome = await decideApprovalsFromChannel({
+          presenceId: presence.id,
+          approvalIds: groupClick.approvalIds,
+          decision: groupClick.decision,
+          clickerExternalUserId: clicker,
+        });
+        if (!responseUrl) return;
+        const text =
+          outcome.kind === "decided"
+            ? groupDecisionText(groupClick.decision, outcome)
+            : escapeSlackText(outcome.message);
+        // A one-row click on a multi-row card must not wipe the other rows,
+        // nor may a partial failure hide rows that are still pending: the
+        // adapter's next poll rewrites the card with what's left. Only a
+        // whole-card, fully settled decision replaces it here.
+        const replaceOriginal =
+          outcome.kind === "decided" &&
+          groupClick.approvalIds.length > 1 &&
+          outcome.failed.length === 0;
+        await fetch(responseUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(
+            replaceOriginal
+              ? { replace_original: true, text }
+              : { replace_original: false, response_type: "ephemeral", text },
+          ),
+          signal: AbortSignal.timeout(10_000),
+        });
+      });
       return c.json({ ok: true });
     }
 
@@ -815,7 +1007,8 @@ export const channelInboundSlackRoutes = () => {
     return c.redirect(started.installUrl);
   });
 
-  // GET /channels/slack/oauth/callback — the events arm's install landing.
+  // GET /channels/slack/oauth/callback — the install landing for both
+  // transports (socket apps get the redirect on a public HTTPS origin).
   app.get("/oauth/callback", async (c) => {
     const state = c.req.query("state");
     const code = c.req.query("code");
@@ -836,16 +1029,19 @@ export const channelInboundSlackRoutes = () => {
     if (denied) return fallback("The install was cancelled in Slack.");
     if (!code) return fallback("This install link is not valid.");
 
-    const apiUrl = publicApiUrl();
-    if (!apiUrl) return fallback("This deployment cannot complete installs.");
-    const redirectUri = `${apiUrl}/v1/channels/slack/oauth/callback`;
+    const redirectUri = oauthCallbackUrl("slack");
+    if (!redirectUri) {
+      return fallback("This deployment cannot complete installs.");
+    }
 
-    // ── The MARKETPLACE arm: no state, so the install began OUTSIDE OneCLI
-    // (Slack's app directory, or the app's sharable URL). Nobody is signed
-    // in yet, so there is no org to bind to — hand the browser to the app
-    // carrying the code, and let the finish page bind it once the person
-    // signs in. Slack requires this path to work: the directory's own
-    // "Add to Slack" button mints exactly this stateless callback. ──
+    // ── The STATELESS arm: no state, so the install began OUTSIDE OneCLI:
+    // the shared app from Slack's directory or its sharable URL, or an
+    // agent's own app from the admin-approval message or "Install to
+    // Workspace". Nobody is signed in yet, so there is no org to bind to.
+    // Hand the browser to the app carrying the code, and let the finish page
+    // resolve it once the person signs in. Slack requires this path to work:
+    // the directory's own "Add to Slack" button mints exactly this stateless
+    // callback. ──
     if (!state) {
       const appUrl = configuredAppUrl();
       if (!appUrl) {
@@ -916,6 +1112,29 @@ export const channelInboundSlackRoutes = () => {
       }
     }
 
+    // ── "Connect your Slack" (licensed): a person's own read-only token,
+    // minted through the agent's app. The completer verifies the state's
+    // signature itself; unlicensed = no completer = refused. ──
+    const userRead = getUserReadConnectCompleter();
+    if (userRead?.handles(stateKind)) {
+      try {
+        const done = await userRead.complete({ state, code, redirectUri });
+        const appUrl = configuredAppUrl();
+        if (!appUrl) {
+          return c.html(
+            `<!doctype html><meta charset="utf-8"><title>Slack connected</title><body style="font-family:system-ui;padding:2rem;max-width:32rem;margin:auto"><p>Your Slack is connected. Close this window and return to the dashboard.</p></body>`,
+          );
+        }
+        return c.redirect(
+          `${appUrl}/w/${encodeURIComponent(done.workspaceId)}/agents/${encodeURIComponent(done.agentId)}/channels?connected=slack-read`,
+        );
+      } catch (err) {
+        if (err instanceof ServiceError) return fallback(err.message);
+        log.error({ err }, "slack user-read connect callback failed");
+        return fallback("Your Slack couldn't be connected.");
+      }
+    }
+
     try {
       const completed = await completePresenceFromOAuth({
         state,
@@ -928,12 +1147,21 @@ export const channelInboundSlackRoutes = () => {
       if (!appUrl) {
         // Installed fine; we just have nowhere configured to send the
         // browser. Say so instead of redirecting into the void.
+        const next = completed.awaitingTransportCredential
+          ? "One step left: return to the dashboard and paste the app-level token."
+          : "Close this window and return to the dashboard.";
         return c.html(
-          `<!doctype html><meta charset="utf-8"><title>Slack install</title><body style="font-family:system-ui;padding:2rem;max-width:32rem;margin:auto"><p>Installed! Close this window and return to the dashboard.</p></body>`,
+          `<!doctype html><meta charset="utf-8"><title>Slack install</title><body style="font-family:system-ui;padding:2rem;max-width:32rem;margin:auto"><p>Installed! ${next}</p></body>`,
         );
       }
+      // A socket install still needs its app-level token: same page, a
+      // different marker, so the dashboard says "one step left" rather than
+      // "connected".
+      const landing = completed.awaitingTransportCredential
+        ? "installed"
+        : "connected";
       return c.redirect(
-        `${appUrl}/w/${encodeURIComponent(completed.workspaceId)}/agents/${encodeURIComponent(completed.agentId)}/channels?connected=slack`,
+        `${appUrl}/w/${encodeURIComponent(completed.workspaceId)}/agents/${encodeURIComponent(completed.agentId)}/channels?${landing}=slack`,
       );
     } catch (err) {
       if (err instanceof ServiceError) return fallback(err.message);

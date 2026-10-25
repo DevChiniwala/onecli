@@ -2,13 +2,17 @@ import { z } from "zod";
 import { readCappedBinaryBody } from "@onecli/channels";
 import {
   adapterActionDecisionResponseSchema,
+  adapterCardFollowUpActionResponseSchema,
+  adapterCardStopResponseSchema,
   adapterConfigResponseSchema,
   adapterCursorResponseSchema,
   adapterDecisionResponseSchema,
+  adapterGroupDecisionResponseSchema,
   adapterIngestResponseSchema,
   adapterPromptClaimResponseSchema,
   adapterReachDecisionResponseSchema,
   adapterRegisterResponseSchema,
+  adapterReplyClaimResponseSchema,
   adapterMentionResolveResponseSchema,
   adapterTranscriptResponseSchema,
   type AdapterMentionReportRequest,
@@ -17,9 +21,15 @@ import {
   adapterWorkResponseSchema,
   type AdapterActionDecisionRequest,
   type AdapterActionDecisionResponse,
+  type AdapterCardFollowUpActionRequest,
+  type AdapterCardFollowUpActionResponse,
+  type AdapterCardStopRequest,
+  type AdapterCardStopResponse,
   type AdapterConfigResponse,
   type AdapterDecisionRequest,
   type AdapterDecisionResponse,
+  type AdapterGroupDecisionRequest,
+  type AdapterGroupDecisionResponse,
   type AdapterIngestRequest,
   type AdapterIngestResponse,
   type AdapterReachDecisionRequest,
@@ -63,6 +73,11 @@ export interface ControlPlaneClient {
   getWork(): Promise<AdapterWorkResponse>;
   ingest(request: AdapterIngestRequest): Promise<AdapterIngestResponse>;
   decide(request: AdapterDecisionRequest): Promise<AdapterDecisionResponse>;
+  /** Forward a grouped-card click; the presence fence and the clicker's
+   * authorization are control-plane-side. */
+  decideGroup(
+    request: AdapterGroupDecisionRequest,
+  ): Promise<AdapterGroupDecisionResponse>;
   /** Forward a reach-card click; authorization is control-plane-side. */
   decideReach(
     request: AdapterReachDecisionRequest,
@@ -72,6 +87,17 @@ export interface ControlPlaneClient {
   decideAction(
     request: AdapterActionDecisionRequest,
   ): Promise<AdapterActionDecisionResponse>;
+  /** Forward a Stop pressed on the narration card; the turn is resolved from
+   * the presence's live card and the clicker authorized control-plane-side. */
+  stopFromCard(
+    request: AdapterCardStopRequest,
+  ): Promise<AdapterCardStopResponse>;
+  /** Forward a control pressed on a waiting message's row of the card; the
+   * row is checked against the card's own turn and the clicker against its
+   * author control-plane-side. */
+  actOnCardFollowUp(
+    request: AdapterCardFollowUpActionRequest,
+  ): Promise<AdapterCardFollowUpActionResponse>;
   claimPrompt(input: {
     approvalId: string;
     presenceId: string;
@@ -95,6 +121,10 @@ export interface ControlPlaneClient {
     next: string,
     turnId?: string,
   ): Promise<boolean>;
+  /** Claim a mid-run follow-up's reply before posting it: true on the
+   * winning compare-and-set, false when a twin or the completion pass got
+   * there first (post nothing then). */
+  claimReply(followUpId: string): Promise<boolean>;
   reportApprovalHealth(presenceId: string, healthy: boolean): Promise<void>;
   /** The proactive credential sweep — staleness is decided server-side.
    * `deferred` counts pairs a transient provider refusal left in place for
@@ -278,6 +308,14 @@ export const createControlPlane = (options: {
         body: request,
       }),
 
+    decideGroup: (request) =>
+      call(
+        "POST",
+        "/channel-adapter/group-decision",
+        adapterGroupDecisionResponseSchema,
+        { body: request },
+      ),
+
     decideReach: (request) =>
       call(
         "POST",
@@ -291,6 +329,22 @@ export const createControlPlane = (options: {
         "POST",
         "/channel-adapter/action-decision",
         adapterActionDecisionResponseSchema,
+        { body: request },
+      ),
+
+    stopFromCard: (request) =>
+      call(
+        "POST",
+        "/channel-adapter/card-stop",
+        adapterCardStopResponseSchema,
+        { body: request },
+      ),
+
+    actOnCardFollowUp: (request) =>
+      call(
+        "POST",
+        "/channel-adapter/card-follow-up-action",
+        adapterCardFollowUpActionResponseSchema,
         { body: request },
       ),
 
@@ -339,6 +393,16 @@ export const createControlPlane = (options: {
         { body: { linkId, expect, next, ...(turnId && { turnId }) } },
       );
       return parsed.advanced;
+    },
+
+    async claimReply(followUpId) {
+      const parsed = await call(
+        "POST",
+        "/channel-adapter/replies/claim",
+        adapterReplyClaimResponseSchema,
+        { body: { followUpId } },
+      );
+      return parsed.claimed;
     },
 
     async reportApprovalHealth(presenceId, healthy) {

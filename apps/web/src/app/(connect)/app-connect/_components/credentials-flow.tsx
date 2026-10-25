@@ -11,9 +11,18 @@ import {
 } from "@onecli/ui/components/collapsible";
 import { Input } from "@onecli/ui/components/input";
 import { Label } from "@onecli/ui/components/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@onecli/ui/components/select";
 import { SecretInput } from "@/components/secret-input";
+import { SetupGuideLink } from "@/lib/components/setup-guide-link";
 import { apiFetch } from "@/lib/api-fetch";
 import { ConnectLayout } from "./connect-layout";
+import { OrDivider } from "./or-divider";
 
 interface FileImportConfig {
   label: string;
@@ -31,7 +40,24 @@ interface CredentialsFlowField {
   group?: string;
   helpUrl?: string;
   helpLabel?: string;
+  /** Fixed choices: rendered as a dropdown instead of a text input. */
+  options?: { value: string; label: string }[];
+  /** Pre-selected option value. */
+  defaultValue?: string;
 }
+
+/** Starting values: every option field begins on its default, so a field the
+ * user never touches is still submitted (and counts as filled). */
+const initialValues = (
+  fields: CredentialsFlowField[],
+): Record<string, string> =>
+  Object.fromEntries(
+    fields.flatMap((f) =>
+      f.options && f.defaultValue !== undefined
+        ? [[f.name, f.defaultValue]]
+        : [],
+    ),
+  );
 
 export interface CredentialsFlowProps {
   app: {
@@ -41,6 +67,8 @@ export interface CredentialsFlowProps {
     darkIcon?: string;
     connectionType: string;
     labelHint?: string;
+    /** The app's OneCLI setup guide (`AppDefinition.setupGuideUrl`). */
+    setupGuideUrl?: string;
   };
   fields: CredentialsFlowField[];
   fileImport?: FileImportConfig;
@@ -51,6 +79,9 @@ export interface CredentialsFlowProps {
   onError: (message: string) => void;
   workspaceId?: string;
   orgId?: string;
+  /** The agent this connect started from: the created (or re-added) account
+   * is switched on for it. */
+  agentId?: string;
   /** Connection method to connect with, when the app offers more than one. */
   method?: string;
   /** When set, shows a link to return to the app's primary (OAuth) flow. */
@@ -67,10 +98,13 @@ export const CredentialsFlow = ({
   onError,
   workspaceId,
   orgId,
+  agentId,
   method,
   onBack,
 }: CredentialsFlowProps) => {
-  const [values, setValues] = useState<Record<string, string>>({});
+  const [values, setValues] = useState<Record<string, string>>(() =>
+    initialValues(fields),
+  );
   const [connectionLabel, setConnectionLabel] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -116,7 +150,7 @@ export const CredentialsFlow = ({
           }
         }
 
-        setValues(mapped);
+        setValues({ ...initialValues(fields), ...mapped });
       } catch {
         onError("Invalid JSON file");
       }
@@ -127,7 +161,7 @@ export const CredentialsFlow = ({
 
   const switchGroup = (group: string) => {
     setActiveGroup(group);
-    setValues({});
+    setValues(initialValues(fields));
   };
 
   const hasInput = visibleFields.every((f) => !!values[f.name]?.trim());
@@ -143,6 +177,7 @@ export const CredentialsFlow = ({
           connectionId,
           ...(connectionLabel.trim() ? { label: connectionLabel.trim() } : {}),
           ...(method ? { method } : {}),
+          ...(agentId ? { agentId } : {}),
         }),
         headers: {
           ...(workspaceId ? { "X-Workspace-Id": workspaceId } : {}),
@@ -191,6 +226,7 @@ export const CredentialsFlow = ({
     >
       <div className="space-y-5 py-2">
         {preContent}
+        <SetupGuideLink appName={app.name} url={app.setupGuideUrl} />
         {fileImport && (
           <>
             <div>
@@ -209,13 +245,7 @@ export const CredentialsFlow = ({
                 {fileImport.label}
               </Button>
             </div>
-            <div className="flex items-center gap-3">
-              <div className="bg-border h-px flex-1" />
-              <span className="text-muted-foreground/60 text-[10px] uppercase tracking-widest">
-                or fill manually
-              </span>
-              <div className="bg-border h-px flex-1" />
-            </div>
+            <OrDivider label="or fill manually" />
           </>
         )}
         {visibleFields.map((field, i) => (
@@ -326,21 +356,41 @@ const FieldInput = ({
       {field.label}
       {!field.optional && <span className="text-destructive ml-0.5">*</span>}
     </Label>
-    {field.description && (
-      <p className="text-xs text-muted-foreground">{field.description}</p>
+    {(field.description || field.helpUrl) && (
+      <p className="text-xs leading-relaxed text-muted-foreground text-pretty">
+        {field.description}
+        {field.description && field.helpUrl && " "}
+        {field.helpUrl && (
+          <a
+            href={field.helpUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="whitespace-nowrap underline decoration-muted-foreground/40 underline-offset-2 transition-colors hover:text-foreground hover:decoration-foreground/60"
+          >
+            {field.helpLabel ?? "Learn more"}
+          </a>
+        )}
+      </p>
     )}
-    {field.helpUrl && (
-      <a
-        href={field.helpUrl}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="w-fit text-xs text-muted-foreground underline decoration-muted-foreground/40 underline-offset-2 transition-colors hover:text-foreground hover:decoration-foreground/60"
-      >
-        {field.helpLabel ?? "Learn more"}
-      </a>
-    )}
-    {field.secret === true ||
-    (field.secret === undefined && connectionType === "api_key") ? (
+    {field.options ? (
+      <Select value={value || undefined} onValueChange={onChange}>
+        <SelectTrigger
+          id={`connect-${field.name}`}
+          className="w-full text-sm"
+          autoFocus={autoFocus}
+        >
+          <SelectValue placeholder={field.placeholder} />
+        </SelectTrigger>
+        <SelectContent>
+          {field.options.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    ) : field.secret === true ||
+      (field.secret === undefined && connectionType === "api_key") ? (
       <SecretInput
         id={`connect-${field.name}`}
         value={value}

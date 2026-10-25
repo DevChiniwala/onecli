@@ -33,7 +33,10 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info, info_span, warn, Instrument};
 
-use approval::{ApprovalDecision, ApprovalStore, PendingApproval, APPROVAL_TIMEOUT_SECS};
+use approval::{
+    ApprovalDecision, ApprovalStore, DecisionOutcome, DenyReason, PendingApproval,
+    APPROVAL_TIMEOUT_SECS,
+};
 use ca::CertificateAuthority;
 use cache::CacheStore;
 use context::auth::AuthUser;
@@ -62,10 +65,14 @@ pub struct GatewayServer {
 ///
 /// - Redirects are disabled so 3xx responses are forwarded to the client as-is.
 /// - `accept_invalid_certs` skips TLS certificate validation for upstream connections.
+/// - DNS goes through the destination guard (`proxy::egress`): a name that
+///   resolves only to non-public addresses fails with a refusal the forward
+///   path turns into a 403, and hyper dials only the addresses it checked.
 fn build_http_client(accept_invalid_certs: bool) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(accept_invalid_certs)
+        .dns_resolver(proxy::egress::resolver())
         .build()
         .expect("build HTTP client")
 }
@@ -235,6 +242,10 @@ impl GatewayServer {
                 .as_deref(),
         );
         let skip_verify_hosts = Arc::new(parse_skip_verify_hosts());
+        // Load the destination guard's allowlist now, so a malformed
+        // GATEWAY_ALLOW_PRIVATE_DESTINATIONS is reported at boot rather than
+        // on the first proxied request.
+        let _ = proxy::egress::policy();
 
         if global_skip {
             warn!("GATEWAY_DANGER_ACCEPT_INVALID_CERTS is enabled: TLS verification disabled for ALL upstream hosts");
@@ -468,30 +479,7 @@ async fn invalidate_cache(
         auth_method = %auth.auth_method,
     );
     async move {
-        let org_id = match db::find_organization_id_by_workspace(
-            &state.policy_engine.pool,
-            &auth.workspace_id,
-        )
-        .await
-        {
-            Ok(Some(oid)) => oid,
-            other => {
-                warn!(
-                    error = ?other.err(),
-                    "cache invalidation: failed to resolve org_id; using broad prefix"
-                );
-                String::new()
-            }
-        };
-
-        state
-            .cache
-            .del_by_prefix(&format!("app_injection:{org_id}:{}:", auth.workspace_id))
-            .await;
-        state
-            .cache
-            .del_by_prefix(&format!("connect:{org_id}:{}:", auth.workspace_id))
-            .await;
+        flush_workspace_cache(&state, &auth.workspace_id).await;
         info!("cache invalidated");
         (
             StatusCode::OK,
@@ -500,6 +488,42 @@ async fn invalidate_cache(
     }
     .instrument(span)
     .await
+}
+
+/// Drop every cached CONNECT resolution (and app injection) for a workspace.
+///
+/// The cached responses carry resolved credential VALUES, so anything that
+/// revokes or replaces a credential must flush them, or a stale value keeps
+/// injecting for up to the cache TTL. The cache is the shared Redis store
+/// when one is configured, so the flush reaches every gateway instance.
+pub(crate) async fn flush_workspace_cache(state: &GatewayState, workspace_id: &str) {
+    let org_id = match db::find_organization_id_by_workspace(
+        &state.policy_engine.pool,
+        workspace_id,
+    )
+    .await
+    {
+        Ok(Some(oid)) => oid,
+        other => {
+            warn!(
+                error = ?other.err(),
+                "cache invalidation: failed to resolve org_id; using broad prefix"
+            );
+            String::new()
+        }
+    };
+
+    state
+        .cache
+        .del_by_prefix(&proxy::connect::injection_cache_prefix(
+            &org_id,
+            workspace_id,
+        ))
+        .await;
+    state
+        .cache
+        .del_by_prefix(&proxy::connect::connect_cache_prefix(&org_id, workspace_id))
+        .await;
 }
 
 // `PendingParams` lives in `crate::approval` (wire shapes shared with the
@@ -535,38 +559,42 @@ async fn get_pending_approvals(
 
         info!(exclude_count = exclude.len(), "approval poll started");
 
-        let mut pending = state
-            .approval_store
-            .list_pending(&org_id, &auth.workspace_id)
-            .await;
-        pending.retain(|a| !exclude.contains(a.id.as_str()));
+        let store = &state.approval_store;
+        let (org, workspace, exclude) = (org_id.as_str(), auth.workspace_id.as_str(), &exclude);
+        let list = move || async move {
+            let mut pending = store.list_pending(org, workspace).await;
+            pending.retain(|a| !exclude.contains(a.id.as_str()));
+            pending
+        };
+
+        let mut pending = list().await;
 
         let mut long_polled = false;
-        if pending.is_empty() {
-            long_polled = true;
-            let mut shutdown_signal = shutdown::subscribe();
-            // A poller holding a connection open for 30 seconds would pin the
-            // drain for its whole window. Answer "nothing pending" at once and
-            // let the SDK re-poll against the replacement instance.
-            let got_new = tokio::select! {
-                got_new = state.approval_store.wait_for_new(
-                    &org_id,
-                    &auth.workspace_id,
-                    std::time::Duration::from_secs(30),
-                ) => got_new,
-                _ = shutdown_signal.wait() => false,
-            };
-            if got_new {
-                // Parallel requests land a beat apart. Answer with the whole
-                // burst, not its first request, so every surface sees one
-                // task at once instead of a card that grows after it shows.
-                tokio::time::sleep(approval::BURST_COALESCE).await;
-                let mut fresh = state
-                    .approval_store
-                    .list_pending(&org_id, &auth.workspace_id)
-                    .await;
-                fresh.retain(|a| !exclude.contains(a.id.as_str()));
-                pending = fresh;
+        if pending.is_empty() && params.long_poll() {
+            // Subscribe BEFORE the list that decides to wait: an approval
+            // stored between an empty list and a later subscribe notifies
+            // nobody and would hold this poll for its whole window. Listing
+            // again after subscribing catches one stored before the
+            // subscription; the subscription catches one stored after it.
+            let new_approval = store.subscribe_new(org, workspace).await;
+            pending = list().await;
+            if pending.is_empty() {
+                long_polled = true;
+                let mut shutdown_signal = shutdown::subscribe();
+                // A poller holding a connection open for 30 seconds would pin the
+                // drain for its whole window. Answer "nothing pending" at once and
+                // let the SDK re-poll against the replacement instance.
+                let got_new = tokio::select! {
+                    got_new = new_approval.wait(std::time::Duration::from_secs(30)) => got_new,
+                    _ = shutdown_signal.wait() => false,
+                };
+                if got_new {
+                    // Parallel requests land a beat apart. Answer with the whole
+                    // burst, not its first request, so every surface sees one
+                    // task at once instead of a card that grows after it shows.
+                    tokio::time::sleep(approval::BURST_COALESCE).await;
+                    pending = list().await;
+                }
             }
         }
 
@@ -655,6 +683,14 @@ async fn submit_approval_decision(
             ApprovalDecision::Approve => "approve",
             ApprovalDecision::Deny => "deny",
         };
+        // A reason qualifies a deny only: an approve carrying one is a
+        // malformed request, never silently accepted.
+        if body.reason.is_some() && body.decision != ApprovalDecision::Deny {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({ "error": "reason_requires_deny" })),
+            );
+        }
 
         // The org id is part of the Redis key. A lookup failure here would
         // otherwise degrade silently into an empty org and a guaranteed
@@ -721,17 +757,21 @@ async fn submit_approval_decision(
         info!(
             approval_id = %approval_id,
             decision = decision_str,
+            reason = ?body.reason,
             "approval decision submitted"
         );
 
         let delivered = state
             .approval_store
-            .submit_decision(
+            .submit_outcome(
                 &org_id,
                 &auth.workspace_id,
                 &approval_id,
-                body.decision,
-                Some(auth.user_id),
+                DecisionOutcome {
+                    decision: body.decision,
+                    approved_by: Some(auth.user_id),
+                    reason: body.reason,
+                },
             )
             .await;
 
@@ -764,6 +804,10 @@ async fn submit_approval_decision(
 #[derive(serde::Deserialize)]
 struct DecisionBody {
     decision: ApprovalDecision,
+    /// Why a deny happened (`superseded`), when it was not a reviewer's
+    /// plain no. Optional: every existing client omits it.
+    #[serde(default)]
+    reason: Option<DenyReason>,
 }
 
 /// Reject non-proxy, non-CONNECT requests to unknown routes with 400 Bad Request.
@@ -839,7 +883,9 @@ async fn handle_connection(
 
 // ── CONNECT handling ────────────────────────────────────────────────────
 
-/// Handle a CONNECT request: authenticate, resolve policy, then MITM.
+/// Handle a CONNECT request: authenticate, resolve, then either terminate
+/// TLS (the MITM lane, the default) or relay the bytes untouched (the open
+/// lane, selected by the proxy username `open`; see `proxy::tunnel`).
 async fn handle_connect(
     req: Request<Incoming>,
     peer_addr: SocketAddr,
@@ -853,12 +899,13 @@ async fn handle_connect(
 
     let hostname = strip_port(&host).to_string();
 
-    // Extract agent token from Proxy-Authorization header. A CONNECT with no
-    // token is refused outright: serving it would mean a raw tunnel — bytes
-    // copied to any host the client names, with no policy, no injection, and
-    // no audit — an open relay wherever this gateway is the only route out of
-    // a sandbox network.
-    let Some(agent_token) = inject::extract_agent_token(&req).filter(|t| !t.is_empty()) else {
+    // Extract the agent credential from Proxy-Authorization. A CONNECT with
+    // no token is refused outright, on either lane: serving it would mean a
+    // raw tunnel — bytes copied to any host the client names, with no
+    // policy, no injection, and no audit — an open relay wherever this
+    // gateway is the only route out of a sandbox network.
+    let Some(credential) = inject::extract_proxy_credential(&req).filter(|c| !c.token.is_empty())
+    else {
         warn!(
             peer = %peer_addr,
             host = %host,
@@ -866,6 +913,8 @@ async fn handle_connect(
         );
         return Ok(proxy::response::proxy_auth_required());
     };
+    let lane = credential.lane();
+    let agent_token = credential.token;
 
     // Resolve at CONNECT time for the agent identity and the injection posture.
     // DB injection/policy rules are NOT frozen here — they're re-resolved
@@ -888,9 +937,10 @@ async fn handle_connect(
     // fallback, but only when DB resolution found no injection for this host.
     // Vault queries are expensive (network calls to Bitwarden), so they're not
     // repeated per request. DB secrets (re-resolved per request from cache)
-    // take precedence when available.
+    // take precedence when available. The open lane never injects, so it
+    // never asks.
     let mut vault_injection_rules = vec![];
-    if !resp.intercept {
+    if lane == inject::ProxyLane::Mitm && !resp.intercept {
         if let Some(ref aid) = resp.workspace_id {
             if let Some(cred) = state.vault_service.request_credential(aid, &hostname).await {
                 let vault_rules = inject::vault_credential_to_rules(&hostname, &cred);
@@ -906,21 +956,27 @@ async fn handle_connect(
         }
     }
 
-    // Every session is MITM'd — even one with no injection rules — so the
-    // gateway can intercept auth errors (401/403/400) and provide actionable
-    // guidance (credential_not_found, app_not_connected, access_restricted).
+    // On the MITM lane every session is terminated, even one with no
+    // injection rules, so the gateway can intercept auth errors (401/403/
+    // 400) and provide actionable guidance (credential_not_found,
+    // app_not_connected, access_restricted). The open lane trades that for
+    // an untouched TLS session: host-level policy and the destination guard
+    // still decide the CONNECT, but nothing inside it is seen or injected.
     let connect::ConnectResponse {
         workspace_id,
         organization_id,
         agent_id,
         agent_name,
         agent_identifier,
+        policy_rules_v2,
+        available_apps,
         ..
     } = resp;
 
     let session_span = info_span!("session",
         peer = %peer_addr,
         host = %host,
+        lane = ?lane,
         workspace_id = workspace_id.as_deref().unwrap_or("-"),
         org_id = organization_id.as_deref().unwrap_or("-"),
         agent = agent_name.as_deref().unwrap_or("-"),
@@ -928,6 +984,37 @@ async fn handle_connect(
     );
 
     info!(parent: &session_span, "CONNECT");
+
+    let proxy_ctx = Arc::new(ProxyContext {
+        workspace_id,
+        organization_id,
+        agent_id,
+        agent_name,
+        agent_identifier,
+        agent_token,
+    });
+
+    // The open lane decides everything before the 200: a refusal has to be
+    // a readable answer, and a dial failure a 502, not a tunnel that opens
+    // and immediately dies.
+    let session = match lane {
+        inject::ProxyLane::Mitm => Session::Mitm,
+        inject::ProxyLane::Open => {
+            let opened = proxy::tunnel::open(
+                &proxy_ctx,
+                &host,
+                &policy_rules_v2,
+                &available_apps,
+                &*state.cache,
+            )
+            .instrument(session_span.clone())
+            .await;
+            match opened {
+                Ok(upstream) => Session::Open(upstream),
+                Err(refusal) => return Ok(proxy::tunnel::refusal_response(refusal)),
+            }
+        }
+    };
 
     let ca = Arc::clone(&state.ca);
     let skip_verify = host_matches_skip_verify(&hostname, &state.skip_verify_hosts);
@@ -946,14 +1033,6 @@ async fn handle_connect(
     };
     let cache = Arc::clone(&state.cache);
     let approval_store = Arc::clone(&state.approval_store);
-    let proxy_ctx = Arc::new(ProxyContext {
-        workspace_id,
-        organization_id,
-        agent_id,
-        agent_name,
-        agent_identifier,
-        agent_token,
-    });
 
     // Taken here, before the spawn, so the session is tracked from the moment
     // it is promised rather than from whenever the new task first runs — the
@@ -964,24 +1043,33 @@ async fn handle_connect(
         async move {
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
-                    // A MITM session is HTTP: the drain waits for it, and
-                    // its inner connection gets its own graceful shutdown.
+                    // Both lanes hold the guard. A MITM session is HTTP and
+                    // drains like one. A tunnel is a pipe with no completion,
+                    // so it ends itself on the signal; the guard makes the
+                    // drain wait for it to do so and write its row.
                     let _guard = session_guard;
-                    let result = proxy::mitm::mitm(
-                        upgraded,
-                        &host,
-                        &ca,
-                        http_client,
-                        ws_connector,
-                        vault_injection_rules,
-                        cache,
-                        proxy_ctx,
-                        approval_store,
-                        Arc::clone(&state.policy_engine),
-                    )
-                    .await;
-                    if let Err(e) = result {
-                        warn!(host = %host, error = ?e, "connection error");
+                    match session {
+                        Session::Open(upstream) => {
+                            proxy::tunnel::serve(upgraded, upstream, &proxy_ctx, &host).await;
+                        }
+                        Session::Mitm => {
+                            let result = proxy::mitm::mitm(
+                                upgraded,
+                                &host,
+                                &ca,
+                                http_client,
+                                ws_connector,
+                                vault_injection_rules,
+                                cache,
+                                proxy_ctx,
+                                approval_store,
+                                Arc::clone(&state.policy_engine),
+                            )
+                            .await;
+                            if let Err(e) = result {
+                                warn!(host = %host, error = ?e, "connection error");
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -994,6 +1082,15 @@ async fn handle_connect(
 
     // 200 tells the client the tunnel is established.
     Ok(Response::new(axum::body::Body::empty()))
+}
+
+/// What a CONNECT becomes once its lane has been decided and, on the open
+/// lane, its upstream dialed.
+enum Session {
+    /// Terminate TLS and serve HTTP inside (`proxy::mitm`).
+    Mitm,
+    /// Relay bytes to the already-connected upstream (`proxy::tunnel`).
+    Open(TcpStream),
 }
 
 // ── HTTP proxy handling ─────────────────────────────────────────────────
@@ -1024,8 +1121,12 @@ async fn handle_http_proxy(
     // reaches an arbitrary host through this proxy — a plain
     // `GET http://host/…` the gateway forwards over the original scheme — so
     // an untokened one is exactly as ungoverned as an untokened tunnel.
-    // Refuse it wherever a tunnel would be refused.
-    let Some(agent_token) = inject::extract_agent_token(&req).filter(|t| !t.is_empty()) else {
+    // Refuse it wherever a tunnel would be refused. There is no lane here:
+    // the gateway reads this request itself, so the username is ignored.
+    let Some(agent_token) = inject::extract_proxy_credential(&req)
+        .map(|c| c.token)
+        .filter(|t| !t.is_empty())
+    else {
         warn!(
             peer = %peer_addr,
             host = %authority,
@@ -1060,6 +1161,35 @@ async fn handle_http_proxy(
         }
     };
 
+    // Custom secrets filling the same slot are disambiguated first (same law
+    // as the MITM path, `mitm::resolve_rules`).
+    let (connection_id, secret_choices) = match connect::select_secret_rules(
+        std::mem::take(&mut resolved.injection_rules),
+        &resolved.app_connections,
+        &hostname,
+        req_path.as_deref(),
+        connection_id.as_deref(),
+    ) {
+        connect::SecretSelection::Rules {
+            rules,
+            app_pin,
+            advertised,
+        } => {
+            resolved.injection_rules = rules;
+            (app_pin, advertised)
+        }
+        connect::SecretSelection::Ambiguous(connections) => {
+            return Ok(proxy::response::multiple_connections_axum(&connections));
+        }
+        connect::SecretSelection::NotFound(connections) => {
+            let cid = connection_id.as_deref().unwrap_or("");
+            return Ok(proxy::response::connection_not_found_axum(
+                cid,
+                &connections,
+            ));
+        }
+    };
+
     // Per-request app connection disambiguation — app rules MERGE with the
     // secret rules (see inject::merge_injection_rules; #428). When the secret
     // rules already serve this request's path, app-side escalations are
@@ -1073,6 +1203,8 @@ async fn handle_http_proxy(
     // `resolved_session_policy`; unlike `connection_label` below, it MUST be
     // threaded (policy decisions bind to it).
     let mut resolved_connection_id: Option<String> = None;
+    // Its provider, for request-log attribution (see `ResolvedRules`).
+    let mut resolved_provider: Option<String> = None;
     // Connections whose credential is minted only after the request is allowed.
     let mut pending_injections: Vec<proxy::connect::PendingInjection> = Vec::new();
     // Host-gated connections that refused this request (wrong host) — see
@@ -1104,6 +1236,7 @@ async fn handle_http_proxy(
                 body_transform,
                 session_policy,
                 connection_id: winning_connection_id,
+                provider,
                 pending,
                 ..
             }) => {
@@ -1112,6 +1245,7 @@ async fn handle_http_proxy(
                 resolved_finalizer = finalizer;
                 resolved_body_transform = body_transform;
                 resolved_session_policy = session_policy;
+                resolved_provider = winning_connection_id.is_some().then_some(provider);
                 resolved_connection_id = winning_connection_id;
             }
             Ok(AppConnectionResult::Ambiguous { connections }) => {
@@ -1135,6 +1269,16 @@ async fn handle_http_proxy(
                     ));
                 }
                 debug!(host = %authority, "requested connection not found; secret rules serve this path");
+            }
+            Ok(AppConnectionResult::NeedsReconnect { connection }) => {
+                if !secrets_serve {
+                    info!(peer = %peer_addr, host = %authority, connection_id = %connection.id, "HTTP proxy: connection needs reconnect; request not forwarded");
+                    return Ok(proxy::response::connection_needs_reconnect_axum(
+                        &connection,
+                        resolved.workspace_id.as_deref(),
+                    ));
+                }
+                debug!(host = %authority, "connection needs reconnect; secret rules serve this path");
             }
             Ok(AppConnectionResult::NoConnections) => {}
             // Nothing injects, exactly as `NoConnections`; the choices ride
@@ -1210,7 +1354,12 @@ async fn handle_http_proxy(
         finalizer: resolved_finalizer,
         body_transform: resolved_body_transform,
         session_policy: resolved_session_policy,
+        github_org_access: proxy::github_org_access::record_for(
+            &resolved.app_connections,
+            resolved_connection_id.as_deref(),
+        ),
         winning_connection_id: resolved_connection_id,
+        winning_provider: resolved_provider,
         budget_bindings: resolved.budget_bindings,
         host_mismatch,
     };
@@ -1267,7 +1416,7 @@ async fn handle_http_proxy(
         }
     };
 
-    connect::inject_connections_header(&mut resp, &resolved.app_connections);
+    connect::inject_connections_header(&mut resp, &resolved.app_connections, &secret_choices);
 
     Ok(resp.map(axum::body::Body::new))
 }

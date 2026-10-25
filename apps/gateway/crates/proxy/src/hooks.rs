@@ -128,17 +128,21 @@ pub async fn pre_forward(
     if let Some(denial) = ee::granular_access::enforce_request(
         rules.session_policy.as_ref(),
         host,
+        method,
         path,
         headers,
         body,
-    ) {
-        warn!(host = %common::util::strip_port(host), %path, reason = %denial.reason, "granular access denied");
+    )
+    .await
+    {
+        warn!(host = %common::util::strip_port(host), path = %super::log_redact::redact_for_log(path), reason = %denial.reason, "granular access denied");
         // The block returns before forward.rs emits telemetry, so log it here —
         // surfaces as a "Blocked" row in the activity feed.
         emit_block_telemetry(proxy_ctx, host, method, path, denial.rule_name);
         return Some(ee_response::forbidden_resource(
             &denial.reason,
             &denial.allowed,
+            denial.hint,
         ));
     }
 
@@ -279,12 +283,30 @@ pub(crate) fn request_meta(
     })
 }
 
+/// Label a row with the app connection that actually injected into it.
+/// `request_meta` resolves the provider from the host, which cannot tell two
+/// apps on one host apart: every GitHub App request resolved to `github`, so
+/// the app was invisible in the activity feed. Uncredentialed rows keep the
+/// host's provider.
+pub(crate) fn attribute_to_connection(
+    meta: &mut RequestMeta,
+    rules: &ResolvedRules,
+    injection_count: usize,
+) {
+    if injection_count == 0 {
+        return;
+    }
+    if let Some(provider) = rules.winning_provider.as_deref() {
+        meta.provider = provider.to_string();
+    }
+}
+
 /// Emits a request-log event for a request the guard blocked. The guard
 /// returns before `forward.rs` runs its normal telemetry, so without this the
 /// denial would be invisible in the activity feed. Mirrors the policy-refusal
 /// rows in `forward.rs`; renders as a red "Blocked" row attributed to
 /// `rule_name`.
-fn emit_block_telemetry(
+pub(crate) fn emit_block_telemetry(
     proxy_ctx: &ProxyContext,
     host: &str,
     method: &str,
@@ -313,6 +335,24 @@ pub(crate) fn record_needs_connection(mut meta: RequestMeta, error: &str) {
     meta.decision = Some(telemetry::core::RequestDecision::NeedsConnection {
         error: error.to_string(),
     });
+    telemetry::on_request(meta.into_event(None));
+}
+
+/// Records a destination-guard refusal (`crate::egress`): a 403 decided
+/// before anything was dialed, so no latency and no spend. Shared by the
+/// HTTP forward path and the WebSocket upgrade. Un-injected and not a policy
+/// rule, so without its own decision the row would be dropped and an agent
+/// probing internal addresses would leave no trace in the activity feed.
+pub(crate) fn record_destination_refused(
+    proxy_ctx: &ProxyContext,
+    host: &str,
+    method: &str,
+    path: &str,
+) {
+    let Some(mut meta) = request_meta(proxy_ctx, host, method, path, 403, 0) else {
+        return;
+    };
+    meta.decision = Some(telemetry::core::RequestDecision::DestinationRefused);
     telemetry::on_request(meta.into_event(None));
 }
 
