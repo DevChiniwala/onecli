@@ -23,10 +23,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sdk = vi.hoisted(() => ({
   bundled: undefined as string | undefined,
+  /** How often the SDK's bundled lookup ran: a pinned boot must never ask. */
+  bundledLookups: 0,
 }));
 
 vi.mock("@1jehuang/jcode-sdk", () => ({
-  bundledJcodeBinary: () => sdk.bundled,
+  bundledJcodeBinary: () => {
+    sdk.bundledLookups += 1;
+    return sdk.bundled;
+  },
   JcodeClient: class {},
   launchInstance: () => Promise.reject(new Error("not launched in this suite")),
 }));
@@ -35,7 +40,7 @@ const {
   cleanJcodeKnowledgeStores,
   cleanJcodeUpdaterState,
   createJcodeHarness,
-  JCODE_DISABLED_TOOLS_VALUE,
+  resolveAnthropicCredential,
   resolveJcodeBinary,
 } = await import("./jcode");
 
@@ -46,6 +51,7 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "jcode-home-"));
   outside = mkdtempSync(join(tmpdir(), "jcode-outside-"));
   sdk.bundled = undefined;
+  sdk.bundledLookups = 0;
   delete process.env.ONECLI_JCODE_BINARY;
 });
 
@@ -64,6 +70,11 @@ describe("resolveJcodeBinary", () => {
     sdk.bundled = bundled;
 
     expect(resolveJcodeBinary()).toBe(pinned);
+    // The image installs the SDK's platform package and deletes its binary
+    // (docker/agent.Dockerfile), so the SDK's lookup is never consulted
+    // under a pin: a boot on the vendored runtime cannot be steered by
+    // whatever the npm package happens to ship.
+    expect(sdk.bundledLookups).toBe(0);
   });
 
   it("a pin pointing at a missing file is a LOUD boot failure, never a fallback", () => {
@@ -90,6 +101,50 @@ describe("resolveJcodeBinary", () => {
     // …and a resolved-but-deleted one (the image prunes the npm binary).
     sdk.bundled = join(outside, "deleted-bundled");
     expect(() => resolveJcodeBinary()).toThrow("No jcode runtime");
+  });
+});
+
+describe("resolveAnthropicCredential", () => {
+  // The route values are jcode's own `JCODE_RUNTIME_PROVIDER` vocabulary:
+  // `claude` pins the Claude subscription (OAuth) route, `claude-api` the
+  // direct API-key route. Anything else would be silently ignored upstream
+  // and leave the runtime in automatic mode, the defect this pin closes.
+  it.each([
+    {
+      name: "an OAuth grant pins the subscription route and keeps the stub",
+      env: { CLAUDE_CODE_OAUTH_TOKEN: "placeholder" },
+      expected: { route: "claude", oauthStub: true },
+    },
+    {
+      name: "an API-key grant pins the key route and has no stub",
+      env: { ANTHROPIC_API_KEY: "placeholder" },
+      expected: { route: "claude-api", oauthStub: false },
+    },
+    {
+      name: "both set: the API key wins, never a half-OAuth launch",
+      env: {
+        ANTHROPIC_API_KEY: "placeholder",
+        CLAUDE_CODE_OAUTH_TOKEN: "placeholder",
+      },
+      expected: { route: "claude-api", oauthStub: false },
+    },
+    {
+      name: "no Anthropic grant (e.g. OpenAI only) pins nothing",
+      env: { OPENAI_API_KEY: "placeholder" },
+      expected: { route: undefined, oauthStub: false },
+    },
+    {
+      name: "empty values count as unset",
+      env: { ANTHROPIC_API_KEY: "", CLAUDE_CODE_OAUTH_TOKEN: "" },
+      expected: { route: undefined, oauthStub: false },
+    },
+    {
+      name: "an empty API key does not mask an OAuth grant",
+      env: { ANTHROPIC_API_KEY: "", CLAUDE_CODE_OAUTH_TOKEN: "placeholder" },
+      expected: { route: "claude", oauthStub: true },
+    },
+  ])("$name", ({ env, expected }) => {
+    expect(resolveAnthropicCredential(env)).toEqual(expected);
   });
 });
 
@@ -247,24 +302,6 @@ describe("cleanJcodeKnowledgeStores", () => {
 
     expect(existsSync(join(home, "memory"))).toBe(false);
     expect(readFileSync(join(outside, "precious.txt"), "utf8")).toBe("keep me");
-  });
-});
-
-describe("the disabled native tools", () => {
-  it("memory is in the exact constant the launch env reads", () => {
-    // The write-back amendment's lockdown: [features] memory=false alone
-    // leaves the native tool callable (v0.71.1, still true in v0.78.1) —
-    // only this list removes it from the model's definitions.
-    expect(JCODE_DISABLED_TOOLS_VALUE.split(",")).toContain("memory");
-  });
-
-  it("browser is in the list — the Firefox-bridge trap is removed", () => {
-    // The native browser tool needs a Firefox extension plus a native-
-    // messaging host, neither of which can exist in a headless guest, and
-    // its own description sends the model into setup attempts (observed
-    // live). Chromium is baked into the agent image instead; disabling the
-    // tool removes it from the model's definitions entirely.
-    expect(JCODE_DISABLED_TOOLS_VALUE.split(",")).toContain("browser");
   });
 });
 

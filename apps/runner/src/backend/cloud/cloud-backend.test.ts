@@ -48,6 +48,7 @@ const spec = (overrides: Partial<SandboxSpec> = {}): SandboxSpec => ({
   homeRef: "home-sbx1",
   limits: { memoryMb: 2048, cpus: 1, pids: 512 },
   payloadHash: "a".repeat(64),
+  resumable: true,
   ...overrides,
 });
 
@@ -173,20 +174,7 @@ describe("createSandbox", () => {
     });
   });
 
-  it("maps the manager's 422 workspace_quota_exceeded to the seam's typed capacity error — the runner then reports at_capacity, the honest copy (step 6)", async () => {
-    manager.nextCreateError = {
-      status: 422,
-      code: "workspace_quota_exceeded",
-      message: "Workspace ws-ws1 is at its home quota",
-    };
-    const backend = backendFor();
-    backend.identify("rnr1");
-    await expect(backend.createSandbox(spec())).rejects.toBeInstanceOf(
-      SandboxCapacityError,
-    );
-  });
-
-  it("maps the WAKE door's quota refusal the same way — a parked home's PVC recreation can hit the fence too", async () => {
+  it("maps the wake's 422 workspace_quota_exceeded to the seam's typed capacity error — the runner then reports at_capacity, the honest copy; the wake is the only call that allocates a home", async () => {
     manager.nextHomeError = {
       status: 422,
       code: "workspace_quota_exceeded",
@@ -233,6 +221,8 @@ describe("lifecycle mapping", () => {
         containerRef: "pod-uid-1",
         running: true,
         payloadHash: "a".repeat(64),
+        // The spawn's resumable mark, round-tripped through the manager.
+        resumable: true,
         // The substrate phase rides along so the boot-crash classifier can tell a
         // terminal container from one still Pending behind an image pull.
         phase: "Running",
@@ -240,10 +230,31 @@ describe("lifecycle mapping", () => {
     ]);
   });
 
+  it("a snapshot from a manager that predates the resumable mark reads as not resumable", async () => {
+    // The manager is deployed separately from the runner; the field is
+    // optional on the wire and its absence must mean "no grace", never a
+    // crash or a true.
+    const backend = backendFor();
+    backend.identify("rnr1");
+    await backend.createSandbox(spec({ resumable: false }));
+    const snapshots = await backend.listSandboxes();
+    expect(snapshots[0]?.resumable).toBe(false);
+  });
+
   it("same-home recreation: the ref is deterministic across provisions", async () => {
     const backend = backendFor();
     expect(await backend.provisionHome("sbx1")).toBe("home-sbx1");
     expect(await backend.provisionHome("sbx1")).toBe("home-sbx1");
+  });
+
+  it("homeRefFor names the home with NO call and agrees with provisionHome, so the stop path parks it without a list", async () => {
+    const backend = backendFor();
+    const before = manager.requests.length;
+    expect(backend.homeRefFor("sbx1")).toBe("home-sbx1");
+    expect(manager.requests.length).toBe(before);
+    expect(await backend.provisionHome("sbx1")).toBe(
+      backend.homeRefFor("sbx1"),
+    );
   });
 
   it("listManaged parses timestamps and preserves nulls", async () => {

@@ -51,6 +51,7 @@ export const APP_CATEGORIES: Record<string, AppCategory> = {
   sentry: "development",
   linear: "development",
   posthog: "development",
+  webflow: "development",
 
   // Project Management
   jira: "project-management",
@@ -82,5 +83,13 @@ export const APP_CATEGORIES: Record<string, AppCategory> = {
   "zoho-crm": "communication",
   granola: "communication",
   fathom: "communication",
+  timeless: "communication",
+  circleback: "communication",
+  pylon: "communication",
+  pagerduty: "development",
+  coralogix: "cloud-data",
+  onyx: "communication",
+  twilio: "communication",
+  dripify: "communication",
   x: "communication",
 };

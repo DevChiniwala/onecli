@@ -1,7 +1,9 @@
 import { Cron } from "croner";
 import { db } from "@onecli/db";
 import { ServiceError } from "./errors";
+import { userIsOrgAdmin } from "./workspace-access-check";
 import type { CronDisabledReason } from "../validations/crons";
+import { isValidTimezone } from "../validations/timezone";
 
 /**
  * Scheduled tasks on hosted agents (plans/hosted-agents-v2.md step 7).
@@ -59,6 +61,44 @@ export interface CronInput {
   timezone: string;
 }
 
+/** Who is acting on a schedule from the dashboard. */
+export interface CronActor {
+  userId: string;
+  organizationId: string;
+}
+
+/**
+ * A schedule runs with its CREATOR's access (the fire-time authorization
+ * anchor): whatever the creator may read, including data shared only with
+ * them, its runs may read. So changing what it does, or making it run, is
+ * the creator's call alone, plus the org's owners and admins. Anyone else
+ * could otherwise rewrite a teammate's prompt and run it to act as that
+ * teammate. Deleting needs no such fence: it only ever narrows what runs.
+ * Without roles (the flat team) every member is an admin, as on every
+ * other admin surface. A schedule whose creator is gone is admin-only.
+ * Not-found shaped for a foreign or missing schedule.
+ */
+const requireCronManager = async (
+  agentId: string,
+  cronId: string,
+  actor: CronActor,
+) => {
+  const cron = await db.agentCron.findFirst({
+    where: { id: cronId, agentId },
+    select: { createdByUserId: true },
+  });
+  if (!cron) throw new ServiceError("NOT_FOUND", "Schedule not found");
+  if (
+    cron.createdByUserId !== actor.userId &&
+    !(await userIsOrgAdmin(actor.userId, actor.organizationId))
+  ) {
+    throw new ServiceError(
+      "FORBIDDEN",
+      "Only the person who created this schedule, or an admin, can change or run it.",
+    );
+  }
+};
+
 /** Consecutive failed runs before a schedule turns itself off. */
 export const CRON_FAILURE_DISABLE_THRESHOLD = 5;
 
@@ -71,9 +111,7 @@ export const CRON_FAILURE_DISABLE_THRESHOLD = 5;
 export const MAX_CRONS_PER_AGENT = 20;
 
 const assertValidTimezone = (timezone: string): void => {
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: timezone });
-  } catch {
+  if (!isValidTimezone(timezone)) {
     throw new ServiceError(
       "UNPROCESSABLE",
       `Unknown timezone "${timezone}". Use an IANA zone name like "America/Los_Angeles"`,
@@ -262,8 +300,10 @@ export const updateCron = async (
   agentId: string,
   cronId: string,
   update: CronUpdate,
+  actor: CronActor,
 ): Promise<AgentCronView> => {
   await requireHostedAgent(workspaceId, agentId);
+  await requireCronManager(agentId, cronId, actor);
   // Fenced read first: existence is decided by the (agentId) pair so a
   // foreign cron id reads as NOT_FOUND, never as a hint.
   const existing = await db.agentCron.findFirst({
@@ -320,8 +360,10 @@ export const runCronNow = async (
   workspaceId: string,
   agentId: string,
   cronId: string,
+  actor: CronActor,
 ): Promise<AgentCronView> => {
   await requireHostedAgent(workspaceId, agentId);
+  await requireCronManager(agentId, cronId, actor);
   const { count } = await db.agentCron.updateMany({
     where: { id: cronId, agentId, enabled: true },
     data: { nextFireAt: new Date() },

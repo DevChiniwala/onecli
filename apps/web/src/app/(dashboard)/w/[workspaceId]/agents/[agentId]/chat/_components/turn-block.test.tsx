@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 import type { Turn } from "@/lib/api/types";
 import { queryKeys } from "@/lib/api/keys";
+import { ApiError } from "@/lib/api/client";
 import type { RenderedTurn } from "@/lib/chat/transcript";
 import { TurnBlock } from "./turn-block";
 
@@ -18,6 +19,32 @@ vi.mock("next/navigation", () => ({
 vi.mock("../../_components/manage-permissions-dialog", () => ({
   ManagePermissionsDialog: () => null,
 }));
+
+// SEND NOW's request, observable without a network.
+const sendNow = vi.hoisted(() => vi.fn());
+const toasts = vi.hoisted(() => ({ info: vi.fn(), error: vi.fn() }));
+vi.mock("sonner", () => ({ toast: toasts }));
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    conversations: { ...actual.conversations, sendNow },
+  };
+});
+
+/** A waiting follow-up's status line can hold SEND NOW, a mutation. A
+ *  wrapper (not a parent element), so `rerender` keeps the client and the
+ *  tree's state. */
+const withQuery = (ui: React.ReactElement) => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return render(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+};
 
 const turn = (overrides: Partial<Turn> = {}): Turn => ({
   id: "t1",
@@ -43,6 +70,8 @@ const rendered = (overrides: Partial<RenderedTurn> = {}): RenderedTurn => ({
   lead: "",
   liveText: "",
   notices: [],
+  supersededApprovalIds: [],
+  desktopRequests: new Map(),
   peerMessages: [],
   peerMessagesOpeningTask: new Set<number>(),
   tools: [],
@@ -51,6 +80,72 @@ const rendered = (overrides: Partial<RenderedTurn> = {}): RenderedTurn => ({
 });
 
 describe("TurnBlock", () => {
+  it("renders the agent's open desktop ask with an Open computer button, and a settled one as a plain line", async () => {
+    const onOpenComputer = vi.fn();
+    const { rerender } = render(
+      <TurnBlock
+        turn={turn()}
+        rendered={rendered({
+          notices: [
+            "Needs you on the desktop: sign in",
+            "Alex took over the desktop and is done.",
+          ],
+          desktopRequests: new Map([
+            [0, { id: "req-1", outcome: "pending" }],
+            [1, { id: "req-1", outcome: "done" }],
+          ]),
+        })}
+        onOpenComputer={onOpenComputer}
+        computerHref={(id) => `/computer?takeover=${id}`}
+      />,
+    );
+    const open = screen.getByRole("button", { name: "Open computer" });
+    await userEvent.click(open);
+    expect(onOpenComputer).toHaveBeenCalledTimes(1);
+    expect(onOpenComputer).toHaveBeenCalledWith("req-1");
+    expect(screen.queryByRole("link", { name: "Open computer" })).toBeNull();
+    expect(
+      screen.getAllByRole("button", { name: "Open computer" }),
+    ).toHaveLength(1);
+    // Where there is no screen to open: plain text.
+    rerender(
+      <TurnBlock
+        turn={turn()}
+        rendered={rendered({
+          notices: ["Needs you on the desktop: sign in"],
+          desktopRequests: new Map([[0, { id: "req-1", outcome: "pending" }]]),
+        })}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Open computer" })).toBeNull();
+    expect(
+      screen.getByText("Needs you on the desktop: sign in"),
+    ).toBeInTheDocument();
+  });
+
+  it("deep-links a pending desktop ask when no in-place callback is available", () => {
+    render(
+      <TurnBlock
+        turn={turn()}
+        rendered={rendered({
+          notices: ["Needs you: sign in", "Desktop request finished"],
+          desktopRequests: new Map([
+            [0, { id: "req-1", outcome: "pending" }],
+            [1, { id: "req-2", outcome: "done" }],
+          ]),
+        })}
+        computerHref={(id) => `/computer?takeover=${id}`}
+      />,
+    );
+    expect(screen.getAllByRole("link", { name: "Open computer" })).toHaveLength(
+      1,
+    );
+    expect(screen.getByRole("link", { name: "Open computer" })).toHaveAttribute(
+      "href",
+      "/computer?takeover=req-1",
+    );
+  });
+
   it("renders the user message and the agent's markdown answer", () => {
     render(
       <TurnBlock
@@ -127,8 +222,45 @@ describe("TurnBlock", () => {
     ).toBeTruthy();
   });
 
-  it("a still-steering follow-up carries the received hint; a joined one is plain", () => {
+  it("answers a follow-up UNDER its own bubble, and the turn's answer still comes last", () => {
+    // The agent replied to the mid-turn message, then kept working.
+    // The reply belongs under the message it answers, rendered as the
+    // agent's own markdown; the turn's closing answer stays the last word.
+    // MUTATION-PROOF: drop the reply and the follow-up reads as ignored.
     render(
+      <TurnBlock
+        turn={turn()}
+        rendered={rendered({ text: "Report sent." })}
+        followUps={[
+          turn({
+            id: "f1",
+            status: "joined",
+            message: "use the Q3 numbers",
+            followUpOfTurnId: "t1",
+          }),
+        ]}
+        followUpRendered={(id) =>
+          id === "f1"
+            ? rendered({ turnId: "f1", text: "Using the **Q3** numbers." })
+            : undefined
+        }
+      />,
+    );
+    const followUp = screen.getByText("use the Q3 numbers");
+    const reply = screen.getByText("Q3");
+    const answer = screen.getByText("Report sent.");
+    expect(reply.tagName).toBe("STRONG");
+    expect(
+      followUp.compareDocumentPosition(reply) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      reply.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("a still-steering follow-up carries the received hint; a joined one is plain", () => {
+    withQuery(
       <TurnBlock
         turn={turn({ status: "running" })}
         rendered={rendered({ ended: false })}
@@ -141,6 +273,354 @@ describe("TurnBlock", () => {
     expect(screen.getByText(/Received, folding it in/)).toBeInTheDocument();
     expect(screen.getByText("first tweak")).toBeInTheDocument();
     expect(screen.getByText("second tweak")).toBeInTheDocument();
+  });
+
+  it("a JOINING follow-up sits BELOW the live work; a JOINED one sits in the exchange above it", () => {
+    // A message the agent has not reached yet belongs after what the agent
+    // is doing now; the moment it is picked up it moves up into the
+    // exchange. MUTATION-PROOF: render both groups in one place and one of
+    // the two orderings below breaks.
+    withQuery(
+      <TurnBlock
+        turn={turn({ status: "running" })}
+        rendered={rendered({ ended: false, liveText: "Checking the logs" })}
+        followUps={[
+          turn({ id: "f1", status: "joined", message: "already read" }),
+          turn({ id: "f2", status: "joining", message: "not yet read" }),
+        ]}
+      />,
+    );
+    const question = screen.getByText("run the report");
+    const liveWork = screen.getByText("Checking the logs");
+    const joined = screen.getByText("already read");
+    const joining = screen.getByText("not yet read");
+    const follows = (a: Element, b: Element) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(follows(question, joined)).toBe(true);
+    expect(follows(joined, liveWork)).toBe(true);
+    expect(follows(liveWork, joining)).toBe(true);
+  });
+
+  describe("SEND NOW on a waiting follow-up", () => {
+    // The run is inside a tool: a step with no result yet.
+    const inTool = rendered({
+      ended: false,
+      tools: [{ callId: "c1", name: "bash" }],
+    });
+    const waiting = (overrides: Partial<Turn> = {}) =>
+      turn({
+        id: "f1",
+        status: "joining",
+        message: "stop and check prod",
+        followUpOfTurnId: "t1",
+        ...overrides,
+      });
+    const file = {
+      id: "a1",
+      name: "notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 3,
+      status: "bound",
+    };
+    const sendNowButton = () =>
+      screen.queryByRole("button", { name: "Send now" });
+
+    it("is offered while the run is inside a tool, beside the received hint", () => {
+      withQuery(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={inTool}
+          followUps={[waiting()]}
+        />,
+      );
+      expect(screen.getByText(/Received, folding it in/)).toBeInTheDocument();
+      expect(sendNowButton()).toBeInTheDocument();
+    });
+
+    it("is NOT offered with nothing to move, before the run started, once read, or for a message with files (and those behind it)", () => {
+      const cases: {
+        turn: Turn;
+        rendered: RenderedTurn;
+        followUps: Turn[];
+      }[] = [
+        // Between tools: nothing running to move.
+        {
+          turn: turn({ status: "running" }),
+          rendered: rendered({
+            ended: false,
+            tools: [{ callId: "c1", name: "bash", output: "ok" }],
+          }),
+          followUps: [waiting()],
+        },
+        // The turn has not started its run yet.
+        {
+          turn: turn({ status: "dispatched" }),
+          rendered: inTool,
+          followUps: [waiting()],
+        },
+        // Already read.
+        {
+          turn: turn({ status: "running" }),
+          rendered: inTool,
+          followUps: [waiting({ status: "joined" })],
+        },
+      ];
+      for (const scenario of cases) {
+        const { unmount } = withQuery(
+          <TurnBlock
+            turn={scenario.turn}
+            rendered={scenario.rendered}
+            followUps={scenario.followUps}
+          />,
+        );
+        expect(sendNowButton()).toBeNull();
+        unmount();
+      }
+    });
+
+    it("a message with files, and one sent after it, get it like any other: both join the live run", () => {
+      withQuery(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={inTool}
+          followUps={[
+            waiting({ attachments: [file] }),
+            waiting({ id: "f2", message: "and this" }),
+          ]}
+        />,
+      );
+      expect(screen.getAllByRole("button", { name: "Send now" })).toHaveLength(
+        2,
+      );
+    });
+
+    it("asks once: in flight it reads 'Sending now…' and is disabled, then 'Asked to read it now'", async () => {
+      let accept: (value: { requested: true }) => void = () => {};
+      sendNow.mockReturnValueOnce(
+        new Promise((resolve) => {
+          accept = resolve;
+        }),
+      );
+      withQuery(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={inTool}
+          followUps={[waiting()]}
+        />,
+      );
+      await userEvent.click(sendNowButton()!);
+      const inFlight = screen.getByRole("button", { name: /Sending now/ });
+      expect(inFlight).toBeDisabled();
+      expect(sendNow).toHaveBeenCalledTimes(1);
+      expect(sendNow.mock.calls[0]?.[0]).toBe("f1");
+      accept({ requested: true });
+      expect(
+        await screen.findByText("Asked to read it now"),
+      ).toBeInTheDocument();
+      expect(sendNowButton()).toBeNull();
+    });
+
+    it("keeps the request's state after the tool ended (the move itself ends it), then shows the agent's answer", async () => {
+      sendNow.mockResolvedValueOnce({ requested: true });
+      const { rerender } = withQuery(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={inTool}
+          followUps={[waiting()]}
+        />,
+      );
+      await userEvent.click(sendNowButton()!);
+      expect(
+        await screen.findByText("Asked to read it now"),
+      ).toBeInTheDocument();
+      // The tool is moved: it reports back, so no tool runs any more.
+      const afterMove = rendered({
+        ended: false,
+        tools: [{ callId: "c1", name: "bash", output: "moved" }],
+      });
+      rerender(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={afterMove}
+          followUps={[waiting()]}
+        />,
+      );
+      expect(screen.getByText("Asked to read it now")).toBeInTheDocument();
+      rerender(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={afterMove}
+          followUps={[waiting()]}
+          followUpRendered={() =>
+            rendered({
+              turnId: "f1",
+              ended: false,
+              sentNow: { moved: true, toolName: "bash" },
+            })
+          }
+        />,
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Moved bash to the background, reading it now",
+      );
+      // Read: the row flips, the whole status line goes with the hint.
+      rerender(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={afterMove}
+          followUps={[waiting({ status: "joined" })]}
+        />,
+      );
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.queryByText(/Received, folding it in/)).toBeNull();
+    });
+
+    it("a refusal that is a state (already read, run ended) is said quietly, and the button comes back", async () => {
+      sendNow.mockRejectedValueOnce(
+        new ApiError("The agent already has this message", 409),
+      );
+      withQuery(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={inTool}
+          followUps={[waiting()]}
+        />,
+      );
+      await userEvent.click(sendNowButton()!);
+      await vi.waitFor(() =>
+        expect(toasts.info).toHaveBeenCalledWith(
+          "The agent already has this message",
+        ),
+      );
+      expect(toasts.error).not.toHaveBeenCalled();
+      expect(sendNowButton()).toBeInTheDocument();
+    });
+
+    it("says what the agent did: the tool it moved, by its bare name, as text", () => {
+      withQuery(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={rendered({ ended: false })}
+          followUps={[waiting()]}
+          followUpRendered={() =>
+            rendered({
+              turnId: "f1",
+              ended: false,
+              sentNow: { moved: true, toolName: "mcp__x__<b>bash</b>" },
+            })
+          }
+        />,
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Moved <b>bash</b> to the background, reading it now",
+      );
+      expect(screen.queryByRole("button", { name: "Send now" })).toBeNull();
+    });
+
+    it("says plainly when nothing was moved", () => {
+      withQuery(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={inTool}
+          followUps={[waiting()]}
+          followUpRendered={() =>
+            rendered({ turnId: "f1", ended: false, sentNow: { moved: false } })
+          }
+        />,
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Nothing to move, it'll be read after this step",
+      );
+    });
+
+    it("a waiting follow-up never shows a reply under it (only its outcome)", () => {
+      withQuery(
+        <TurnBlock
+          turn={turn({ status: "running" })}
+          rendered={inTool}
+          followUps={[waiting()]}
+          followUpRendered={() =>
+            rendered({ turnId: "f1", ended: false, liveText: "on it" })
+          }
+        />,
+      );
+      expect(screen.queryByText("on it")).toBeNull();
+    });
+  });
+
+  it("streams a follow-up's reply as it is written, then settles it to markdown", () => {
+    // The reply's deltas ride the follow-up's own id while the agent
+    // writes; the durable `text` replaces them. Live: transient narration
+    // (plain text, never markdown: untrusted mid-turn output). Settled: the
+    // agent's markdown answer.
+    const followUps = [
+      turn({ id: "f1", status: "joined", message: "use the Q3 numbers" }),
+    ];
+    const { rerender } = render(
+      <TurnBlock
+        turn={turn({ status: "running" })}
+        rendered={rendered({ ended: false })}
+        followUps={followUps}
+        followUpRendered={() =>
+          rendered({ turnId: "f1", liveText: "Using the **Q3**", ended: false })
+        }
+      />,
+    );
+    // Streaming: the raw words, asterisks and all, inside a paragraph.
+    const live = screen.getByText("Using the **Q3**");
+    expect(live.tagName).toBe("P");
+    expect(screen.queryByText("Q3")).toBeNull();
+
+    rerender(
+      <TurnBlock
+        turn={turn({ status: "running" })}
+        rendered={rendered({ ended: false })}
+        followUps={followUps}
+        followUpRendered={() =>
+          rendered({ turnId: "f1", text: "Using the **Q3** numbers." })
+        }
+      />,
+    );
+    expect(screen.getByText("Q3").tagName).toBe("STRONG");
+    expect(screen.queryByText("Using the **Q3**")).toBeNull();
+  });
+
+  it("drops a follow-up's live tail when the turn ends with those words as ITS answer", () => {
+    // The agent answered the follow-up and said nothing more before the
+    // turn ended (a stop, or the reply was its last words): the supervisor
+    // keeps those words as the TURN's answer, so no `text` ever lands under
+    // the follow-up, and the row has no terminal event to clear its tail.
+    // The tail must die with the turn, like the turn's own, or the words
+    // show twice: as a stale live tail under the bubble and as the answer.
+    const followUps = [
+      turn({ id: "f1", status: "joined", message: "what is 7 times 6?" }),
+    ];
+    const live = rendered({
+      turnId: "f1",
+      liveText: "7 times 6 is 42.",
+      ended: false,
+    });
+    const { rerender } = render(
+      <TurnBlock
+        turn={turn({ status: "running" })}
+        rendered={rendered({ ended: false })}
+        followUps={followUps}
+        followUpRendered={() => live}
+      />,
+    );
+    expect(screen.getByText("7 times 6 is 42.")).toBeTruthy();
+
+    rerender(
+      <TurnBlock
+        turn={turn({ status: "done" })}
+        rendered={rendered({ text: "7 times 6 is 42.\n\nALL DONE." })}
+        followUps={followUps}
+        followUpRendered={() => live}
+      />,
+    );
+    // Once, as the turn's answer; never again under the bubble.
+    expect(screen.getAllByText(/7 times 6 is 42\./)).toHaveLength(1);
+    expect(screen.getByText("ALL DONE.")).toBeTruthy();
   });
 
   it("shows a tool call with its output behind a disclosure, as text", async () => {
@@ -169,6 +649,44 @@ describe("TurnBlock", () => {
     const output = screen.getByText(/results/);
     expect(output.textContent).toContain("<script>alert(1)</script>");
     expect(document.querySelector("script")).toBeNull();
+  });
+
+  it("discloses optional input while running and retains failed output after settling", async () => {
+    const user = userEvent.setup();
+    const tool = {
+      callId: "input-call",
+      name: "bash",
+      input: JSON.stringify({ command: "echo '<script>bad()</script>'" }),
+    };
+    const { container, rerender } = render(
+      <TurnBlock
+        turn={turn({ status: "running" })}
+        rendered={rendered({ ended: false, tools: [tool] })}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /Running a command/ }));
+    await user.click(screen.getByRole("button", { name: /echo/ }));
+    expect(screen.getByText("Request")).toBeInTheDocument();
+    expect(container.querySelector("pre")?.textContent).toBe(
+      JSON.stringify(JSON.parse(tool.input), null, 2),
+    );
+    expect(screen.queryByText("Output")).toBeNull();
+    expect(container.querySelector("script")).toBeNull();
+
+    rerender(
+      <TurnBlock
+        turn={turn()}
+        rendered={rendered({
+          tools: [{ ...tool, output: "bash: denied", isError: true }],
+        })}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /Ran a command/ }));
+    await user.click(screen.getByRole("button", { name: /echo/ }));
+    expect(screen.getByText("Request")).toBeInTheDocument();
+    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.getByText("Failed")).toBeInTheDocument();
+    expect(screen.getByText("bash: denied")).toHaveClass("text-red-700");
   });
 
   it("renders the running turn as a work log, in order, as plain text", () => {
@@ -404,6 +922,31 @@ describe("a platform automation delivery turn", () => {
     // …and it is NOT a right-aligned user bubble with a "via watch" chip (the
     // exact regression). MUTATION-PROOF: revert turn-block to the unconditional
     // <UserBubble> and both the end-aligned bubble and the chip reappear.
+    expect(container.querySelector('[data-align="end"]')).toBeNull();
+    expect(screen.queryByText(/via watch/i)).not.toBeInTheDocument();
+  });
+
+  it("renders a wake that JOINED the turn as a system label, never a user bubble", () => {
+    // A wake joining a running wake rides as a follow-up row; it is the
+    // platform's instruction, so it gets the same quiet header a standalone
+    // delivery does. MUTATION-PROOF: render every follow-up as <UserBubble>
+    // and the "via watch" chip and a second end-aligned bubble reappear.
+    const { container } = render(
+      <TurnBlock
+        turn={turn({ source: "watch", message: 'Watch on "tests"' })}
+        rendered={rendered({ text: "Both runs passed." })}
+        followUps={[
+          turn({
+            id: "f1",
+            status: "joined",
+            source: "watch",
+            message: 'Watch on "lint"',
+            followUpOfTurnId: "t1",
+          }),
+        ]}
+      />,
+    );
+    expect(screen.getByText('Watch on "lint"')).toBeInTheDocument();
     expect(container.querySelector('[data-align="end"]')).toBeNull();
     expect(screen.queryByText(/via watch/i)).not.toBeInTheDocument();
   });
@@ -650,6 +1193,80 @@ describe("a turn that could not run for a reason the reader can fix", () => {
     ).toHaveClass("text-destructive");
   });
 
+  // An uncoded failure that carries a provider's raw response body: nothing
+  // classified it, so no fix is offered, but the reader never gets the blob
+  // as the message.
+  const RAW_PROVIDER_ERROR =
+    'Claude API error (500 Internal Server Error): {"type":"error","error":{"type":"api_error","message":"Internal server error"}}';
+
+  it("folds an uncoded raw provider body behind Technical details", async () => {
+    const user = userEvent.setup();
+    render(
+      <TurnBlock
+        turn={turn({
+          status: "failed",
+          error: RAW_PROVIDER_ERROR,
+          errorCode: null,
+        })}
+        rendered={undefined}
+        modelsHref="/w/p1/agents/a1/models"
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "The agent ran into an error and couldn't finish this message.",
+    );
+    expect(document.querySelector(".text-destructive")).toBeNull();
+    // Nothing classified it, so no key fix is claimed.
+    expect(screen.queryByRole("link")).toBeNull();
+    // Collapsed: the blob is not on screen until asked for.
+    const trigger = screen.getByRole("button", { name: "Technical details" });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/Internal Server Error/)).toBeNull();
+
+    await user.click(trigger);
+    const details = screen.getByText(/Internal Server Error/);
+    expect(details.textContent).toBe(RAW_PROVIDER_ERROR);
+    // Outside the live region: expanding never reads the blob aloud.
+    expect(screen.getByRole("status")).not.toContainElement(details);
+  });
+
+  it("folds the stream's raw error too, once the turn settles", () => {
+    // The uncoded harness failure's usual shape: turn.error is NULL and the
+    // transcript's error event is the only witness.
+    render(
+      <TurnBlock
+        turn={turn({ status: "failed", error: null })}
+        rendered={rendered({ error: RAW_PROVIDER_ERROR })}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "The agent ran into an error and couldn't finish this message.",
+    );
+    expect(
+      screen.getByRole("button", { name: "Technical details" }),
+    ).toBeInTheDocument();
+  });
+
+  it("renders the payload as text, never as markup", async () => {
+    const user = userEvent.setup();
+    render(
+      <TurnBlock
+        turn={turn({
+          status: "failed",
+          error:
+            'Claude API error (502 Bad Gateway): <html><body><script>alert(1)</script><img src=x onerror="alert(2)"></body></html>',
+        })}
+        rendered={undefined}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Technical details" }));
+    expect(screen.getByText(/502 Bad Gateway/).textContent).toContain(
+      "<script>alert(1)</script>",
+    );
+    expect(document.querySelector("script")).toBeNull();
+    expect(document.querySelector("img")).toBeNull();
+  });
+
   it("renders a notice alongside an answer, without ending the turn", () => {
     // The whole reason `notice` is not an `error` event: the agent degraded to
     // a different model AND still answered, so both belong on screen.
@@ -701,19 +1318,6 @@ describe("a turn that could not run for a reason the reader can fix", () => {
   });
 
   describe("the agent's files (send_file)", () => {
-    const withQuery = (ui: React.ReactElement) =>
-      render(
-        <QueryClientProvider
-          client={
-            new QueryClient({
-              defaultOptions: { queries: { retry: false } },
-            })
-          }
-        >
-          {ui}
-        </QueryClientProvider>,
-      );
-
     it("renders outbound files under the AGENT's answer and inbound files under the PERSON's bubble — never mixed", () => {
       const { container } = withQuery(
         <TurnBlock

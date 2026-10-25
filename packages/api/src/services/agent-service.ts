@@ -2,11 +2,13 @@ import { randomBytes } from "crypto";
 import { db, Prisma } from "@onecli/db";
 import type { AgentEffort } from "@onecli/agent-protocol";
 import { ServiceError } from "./errors";
+import { agentTokenIsUserVisible } from "./agent-token-visibility";
 import { agentImageUrlOrNull } from "./agent-image-service";
 import { LAST_SEEN_WINDOW_MS } from "../lib/agent-activity";
 import { agentIdsWithLiveBackgroundWork, signalWork } from "./due-work";
 import { pickRunnerForSandbox } from "./placement";
-import { requestSandboxRespawn } from "./sandbox-service";
+import { requestAgentRestart, requestSandboxRespawn } from "./sandbox-service";
+import { closeRuntimeInterval } from "./runtime-ledger";
 import { bumpHomeForAgent } from "./home-sync-service";
 import { resolveAgentLlmCredential } from "./llm-credential-service";
 import { syncAgentPresenceNames } from "./channels/agent-channel-service";
@@ -18,7 +20,6 @@ import {
 } from "./channels/channel-cleanup-service";
 import { presenceSettingsUrlFor } from "./channels/registry";
 import { autoAttachLlmKeys } from "./llm-autoattach-service";
-import { attachWorkspaceResourcesToNewAgent } from "./workspace-autoattach-service";
 import { dropPrincipalFromPolicyInTx, lockScope } from "./policy-service";
 import { llmProvider } from "../llm/registry";
 import { isOnpremEdition } from "../lib/policy-flags";
@@ -39,6 +40,13 @@ const logAgentConflict = createLogAgentConflict(logger);
 
 export const generateAccessToken = () =>
   `aoc_${randomBytes(32).toString("hex")}`;
+
+/** The `accessToken` field for an agent row, present only when visible. */
+const exposedAccessToken = (
+  kind: string,
+  accessToken: string,
+): { accessToken?: string } =>
+  agentTokenIsUserVisible(kind) ? { accessToken } : {};
 
 export interface CreateAgentInput {
   name: string;
@@ -101,8 +109,9 @@ export const listAgents = async (workspaceId: string) => {
     lastSeenRows.map((r) => [r.agentId, r._max.createdAt]),
   );
 
-  return agents.map(({ imageKey, ...a }) => ({
+  return agents.map(({ imageKey, accessToken, ...a }) => ({
     ...a,
+    ...exposedAccessToken(a.kind, accessToken),
     channels: a.channels.map((c) => ({
       ...c,
       settingsUrl: presenceSettingsUrlFor(c.provider, c.externalId),
@@ -185,7 +194,7 @@ export const agentExistsByIdentifier = async (
 export const createAgent = async (
   workspaceId: string,
   input: CreateAgentInput,
-  /** Who to record as the grantor of every auto-attached grant. */
+  /** Who to record as the grantor of an auto-attached LLM key grant. */
   userId: string | null = null,
 ) => {
   const trimmed = input.name.trim();
@@ -341,10 +350,9 @@ export const createAgent = async (
       userId,
     ).catch(() => ({ secretIds: [] as string[] }));
 
-    // Every workspace connection and custom secret is on for a new agent too
-    // (`workspace-autoattach-service`), so it can work right away. Runs after
-    // the LLM attach and is best-effort the same way: it never fails create.
-    await attachWorkspaceResourcesToNewAgent(workspaceId, agent.id, userId);
+    // Nothing else is granted: a new agent starts with no connection and no
+    // custom secret, and the user picks what it gets (the dashboard's "choose
+    // connections" step right after creation).
 
     // `llmKeys` is part of the create contract: an empty array means the
     // workspace has no LLM key, which is the one thing a caller must be able
@@ -401,6 +409,15 @@ export const deleteAgent = async (workspaceId: string, agentId: string) => {
       id: agentId,
       workspaceId,
     });
+    // The ledger row outlives the agent (plain ids, no cascade), so the
+    // delete is also the end of whatever run is open: close it here, in
+    // the same transaction, before the sandbox row the close is keyed on
+    // cascades away.
+    const sandbox = await tx.sandbox.findUnique({
+      where: { agentId },
+      select: { id: true },
+    });
+    if (sandbox) await closeRuntimeInterval(tx, sandbox.id, "deleted");
     await tx.agent.delete({ where: { id: agentId } });
     return ids;
   });
@@ -613,7 +630,7 @@ export const updateAgent = async (
 export const regenerateAgentToken = async (
   workspaceId: string,
   agentId: string,
-) => {
+): Promise<{ accessToken: string } | { rotated: true }> => {
   const agent = await db.agent.findFirst({
     where: { id: agentId, workspaceId },
     select: { id: true, kind: true },
@@ -638,5 +655,34 @@ export const regenerateAgentToken = async (
     signalWork();
   }
 
-  return { accessToken: updated.accessToken };
+  // Rotation still revokes a hosted agent's token (its sandbox picks up the
+  // new one on respawn); only the value stays server-side.
+  return agentTokenIsUserVisible(agent.kind)
+    ? { accessToken: updated.accessToken }
+    : { rotated: true };
+};
+
+/**
+ * "Restart agent": every conversation of this hosted agent starts a fresh
+ * harness session, in-flight work ends, and a running sandbox stops so the
+ * next message cold-starts a new one (see `requestAgentRestart`). The way
+ * out of any state the agent cannot answer from: a damaged saved history, a
+ * stuck run, or an agent image the running box predates.
+ */
+export const restartAgent = async (
+  workspaceId: string,
+  agentId: string,
+): Promise<void> => {
+  const agent = await db.agent.findFirst({
+    where: { id: agentId, workspaceId },
+    select: { id: true, kind: true },
+  });
+  if (!agent) throw new ServiceError("NOT_FOUND", "Agent not found");
+  if (agent.kind !== "hosted") {
+    throw new ServiceError(
+      "UNPROCESSABLE",
+      "Only hosted agents can be restarted",
+    );
+  }
+  await requestAgentRestart(agent.id, workspaceId);
 };

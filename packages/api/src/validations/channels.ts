@@ -1,7 +1,13 @@
 import { z } from "zod";
 import {
+  adapterCardFollowUpActionRequestSchema,
+  adapterCardStopRequestSchema,
+  adapterGroupDecisionRequestSchema,
+} from "@onecli/agent-protocol";
+import {
   CHANNEL_PROVIDER_IDS,
   CHANNEL_TRANSPORTS,
+  LISTEN_MODES,
 } from "../services/channels/types";
 
 /**
@@ -31,10 +37,11 @@ export const connectIntegrationSchema = z
   })
   .strict();
 
-/** POST /v1/org/channels/:provider/finish-install/inspect — the Slack
- * authorization code parked by a marketplace install. Opaque to us; bounded
- * because it rides a URL. */
-export const inspectInstallSchema = z
+/** POST /v1/org/channels/:provider/agent-install and
+ * POST /v1/org/channels/:provider/finish-install/inspect: the provider's
+ * authorization code from an install begun on the provider's side, parked
+ * on /slack/installed. Opaque to us; bounded because it rides a URL. */
+export const installCodeSchema = z
   .object({
     code: z.string().trim().min(1).max(2_000),
   })
@@ -57,10 +64,12 @@ export const addUserLinkSchema = z
   })
   .strict();
 
-/** POST /v1/agents/:agentId/channels/:provider/complete */
+/** POST /v1/agents/:agentId/channels/:provider/complete. `botToken` may be
+ * omitted only on a socket presence a consent install already gave one; the
+ * provider enforces that. */
 export const completePresenceSchema = z
   .object({
-    botToken: z.string().trim().min(1).max(500),
+    botToken: z.string().trim().min(1).max(500).optional(),
     appToken: z.string().trim().min(1).max(500).optional(),
     signingSecret: z.string().trim().min(1).max(500).optional(),
     appId: z.string().trim().min(1).max(100).optional(),
@@ -107,6 +116,11 @@ export const setReachStateSchema = z
   })
   .strict();
 
+/** Promote/demote the agent in a channel: what it hears there. */
+export const setSpaceListenSchema = z
+  .object({ listen: z.enum(LISTEN_MODES) })
+  .strict();
+
 /** PUT /v1/agents/:agentId/channels/:provider/reach/people/:externalRef -
  * the dashboard's per-person settlement. Two answers only: a single human
  * either may reach the agent or may not; "OneCLI users only" describes a
@@ -139,6 +153,22 @@ export const adapterDecisionSchema = z
     clickerExternalUserId: z.string().trim().min(1).max(200),
   })
   .strict();
+
+/** POST /channel-adapter/group-decision - a grouped approval card's click
+ * (Approve all / Deny all / one row). The shared wire schema, made strict
+ * like its siblings here: an unknown field is a 422, never ignored. */
+export const adapterGroupDecisionSchema =
+  adapterGroupDecisionRequestSchema.strict();
+
+/** POST /channel-adapter/card-stop - a Stop pressed on the narration card
+ * (socket arm). The shared wire schema, strict like its siblings here. */
+export const adapterCardStopSchema = adapterCardStopRequestSchema.strict();
+
+/** POST /channel-adapter/card-follow-up-action - a control pressed on a
+ * waiting message's row of the narration card (socket arm). The shared wire
+ * schema, strict like its siblings here. */
+export const adapterCardFollowUpActionSchema =
+  adapterCardFollowUpActionRequestSchema.strict();
 
 /** POST /channel-adapter/action-decision - a forwarded action-approval-card
  * click (socket arm). Mirrors adapterReachDecisionSchema; the wire schema is
