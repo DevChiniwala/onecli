@@ -10,8 +10,10 @@ import {
   recordAuditEvent,
 } from "../audit-service";
 import { cleanLabel } from "../../lib/format";
+import { dashboardUrl } from "../../lib/dashboard-url";
 import { logger } from "../../lib/logger";
 import { writeConversationNotice } from "../conversation-notice";
+import { previousRunStartedAt } from "../turn-service";
 import { authorizeChannelUser } from "./channel-ingestion-service";
 import { dmReachableOwners, cardRefsOf } from "./agent-reach-service";
 import { channelProvider } from "./registry";
@@ -69,8 +71,14 @@ export interface ApprovedAction {
   id: string;
   agentId: string;
   conversationId: string | null;
+  /** The turn that asked (the notice anchor), when there was one. Lets a
+   * handler attribute its follow-on records to the person who asked. */
+  originTurnId: string | null;
   action: string;
   payload: Prisma.JsonValue;
+  /** Who approved it. Lets a handler record follow-on grants in that
+   * person's name (send_message: opening the recipient's replies). */
+  decidedByUserId: string;
 }
 
 /**
@@ -82,7 +90,15 @@ export interface ApprovedAction {
  * async-execution mode (ack first, execute after) is the recorded
  * follow-up if a future action genuinely needs it.
  */
-type ActionHandler = (approval: ApprovedAction) => Promise<void>;
+type ActionHandler = (
+  approval: ApprovedAction,
+  /** In-memory only, never persisted: the credential a
+   * `requiresSecretValue` action's approver typed. Undefined otherwise. */
+  context: { secretValue?: string },
+) => Promise<string | void>;
+// A handler may return a short platform-composed NOTE (never a secret) that
+// rides the executed outcome line to the person and the model, e.g. the id
+// of what it created.
 
 /**
  * One registered action: the execute handler, plus an optional standing-
@@ -98,6 +114,11 @@ interface RegisteredAction {
     approval: ApprovedAction,
     deciderUserId: string,
   ) => Promise<void>;
+  /** The approval can only execute with a credential the approver types
+   * (custom connections). The generic decide doors (dashboard decision
+   * route, Slack click) refuse to APPROVE it; only the action's dedicated
+   * route, which carries the value, can. Rejecting stays generic. */
+  requiresSecretValue?: boolean;
 }
 
 /**
@@ -112,13 +133,35 @@ const handlers = new Map<string, RegisteredAction>();
 export const registerActionHandler = (
   action: string,
   handler: ActionHandler,
-  options?: { alwaysAllow?: RegisteredAction["alwaysAllow"] },
+  options?: {
+    alwaysAllow?: RegisteredAction["alwaysAllow"];
+    requiresSecretValue?: boolean;
+  },
 ): void => {
   if (handlers.has(action)) {
     throw new Error(`action handler already registered: ${action}`);
   }
-  handlers.set(action, { handler, alwaysAllow: options?.alwaysAllow });
+  if (options?.requiresSecretValue && options.alwaysAllow) {
+    // A standing grant would let a later approve skip the value.
+    throw new Error(
+      `a secret-value action can't offer always-allow: ${action}`,
+    );
+  }
+  handlers.set(action, {
+    handler,
+    alwaysAllow: options?.alwaysAllow,
+    requiresSecretValue: options?.requiresSecretValue === true,
+  });
 };
+
+/** Whether approving this action needs a credential typed by the approver
+ * (so only its dedicated route can approve it; see `RegisteredAction`). */
+export const actionRequiresSecretValue = (action: string): boolean =>
+  handlers.get(action)?.requiresSecretValue === true;
+
+/** The refusal a generic door gives a value-requiring approve. */
+export const NEEDS_SECRET_VALUE_MESSAGE =
+  "This request needs a key that only you can enter. Review it in the OneCLI chat.";
 
 /** Whether an action offers the "always allow" upgrade — the card renderer
  * and the bell's listing ask this to decide whether the third button exists
@@ -229,6 +272,15 @@ const postActionApprovalCards = async (approvalId: string): Promise<void> => {
   const credentialsJson = await getCrypto().decrypt(presence.credentials);
   for (const owner of owed) {
     try {
+      // A value-requiring action is decided in the dashboard only: the
+      // card is a link there, never an Approve button. Built inside the
+      // guard: a misconfigured origin must fail the post, not the ask.
+      const reviewUrl = actionRequiresSecretValue(approval.action)
+        ? dashboardUrl(
+            `/agents/${encodeURIComponent(approval.agent.id)}/chat`,
+            { workspaceId: approval.agent.workspaceId },
+          )
+        : undefined;
       const ref = await cardUi.post({
         credentialsJson,
         recipientExternalUserId: owner.externalUserId,
@@ -236,6 +288,7 @@ const postActionApprovalCards = async (approvalId: string): Promise<void> => {
         agentName: approval.agent.name,
         summary: approval.summary,
         offerAlwaysAllow: actionSupportsAlwaysAllow(approval.action),
+        ...(reviewUrl && { reviewUrl }),
       });
       posted.push({ channel: ref.channel, ts: ref.ts, userId: owner.userId });
       await db.actionApproval.update({
@@ -252,7 +305,14 @@ const postActionApprovalCards = async (approvalId: string): Promise<void> => {
 };
 
 export type ActionDecisionResult =
-  | { kind: "decided"; status: ActionApprovalStatus }
+  | {
+      kind: "decided";
+      status: ActionApprovalStatus;
+      /** What was decided, and by whom: the clicked card settles to the
+       * same words every other posted card does. */
+      summary: string;
+      decidedByName: string;
+    }
   | { kind: "already_settled" }
   | { kind: "refused"; message: string };
 
@@ -269,6 +329,10 @@ export const decideActionApproval = async (input: {
   decision: "approve" | "approve_always" | "reject";
   deciderUserId: string;
   reason?: string;
+  /** The approver-typed credential for a `requiresSecretValue` action. Held
+   * in memory for the handler call only: never written to the row, the
+   * audit, the notice or a log. Only the action's dedicated route sets it. */
+  secretValue?: string;
 }): Promise<ActionDecisionResult> => {
   const approval = await db.actionApproval.findUnique({
     where: { id: input.approvalId },
@@ -290,6 +354,16 @@ export const decideActionApproval = async (input: {
     return { kind: "refused", message: "This request no longer exists." };
   }
   if (approval.status !== "pending") return { kind: "already_settled" };
+  // A value-requiring action can only be APPROVED with its value (the
+  // dedicated route). Checked BEFORE the flip so the generic doors leave the
+  // row pending for the real decision. Rejecting needs no value.
+  if (
+    input.decision !== "reject" &&
+    actionRequiresSecretValue(approval.action) &&
+    !input.secretValue
+  ) {
+    return { kind: "refused", message: NEEDS_SECRET_VALUE_MESSAGE };
+  }
   if (approval.expiresAt.getTime() < Date.now()) {
     // Lazily park an expired-but-unswept row so a click never approves a
     // dead ask. The same atomic flip as the sweep — a racing sweep or twin
@@ -349,7 +423,7 @@ export const decideActionApproval = async (input: {
   });
 
   let finalStatus: ActionApprovalStatus;
-  let failure: string | null = null;
+  let detail: string | null = null;
   if (input.decision === "reject") {
     finalStatus = "rejected";
   } else {
@@ -358,14 +432,16 @@ export const decideActionApproval = async (input: {
     const registered = handlers.get(approval.action);
     if (!registered) {
       finalStatus = "failed";
-      failure = `no handler registered for "${approval.action}"`;
+      detail = `no handler registered for "${approval.action}"`;
     } else {
       const frozen: ApprovedAction = {
         id: approval.id,
         agentId: approval.agentId,
         conversationId: approval.conversationId,
+        originTurnId: approval.originTurnId,
         action: approval.action,
         payload: approval.payload,
+        decidedByUserId: input.deciderUserId,
       };
       // The standing grant FIRST, best-effort: a failed upsert must not
       // block the send the owner just approved — the next send simply asks
@@ -381,16 +457,24 @@ export const decideActionApproval = async (input: {
         }
       }
       try {
-        await registered.handler(frozen);
+        const note = await registered.handler(frozen, {
+          ...(registered.requiresSecretValue &&
+            input.secretValue !== undefined && {
+              secretValue: input.secretValue,
+            }),
+        });
         finalStatus = "executed";
+        if (typeof note === "string" && note) {
+          detail = cleanLabel(note, MAX_REASON_CHARS);
+        }
       } catch (err) {
         finalStatus = "failed";
-        failure = cleanLabel(String(err), MAX_REASON_CHARS);
+        detail = cleanLabel(String(err), MAX_REASON_CHARS);
       }
     }
     await db.actionApproval.update({
       where: { id: approval.id },
-      data: { status: finalStatus, ...(failure ? { reason: failure } : {}) },
+      data: { status: finalStatus, ...(detail ? { reason: detail } : {}) },
     });
   }
 
@@ -398,9 +482,14 @@ export const decideActionApproval = async (input: {
     approval,
     finalStatus,
     decider.name || decider.email,
-    input.decision === "reject" ? reason : failure,
+    input.decision === "reject" ? reason : detail,
   );
-  return { kind: "decided", status: finalStatus };
+  return {
+    kind: "decided",
+    status: finalStatus,
+    summary: approval.summary,
+    decidedByName: decider.name || decider.email,
+  };
 };
 
 /**
@@ -570,11 +659,26 @@ export const listActionApprovals = async (input: {
 
 // ── Settlement: cards + the outcome notice ─────────────────────────────────
 
+/** The terminal statuses: every one has an outcome line. */
+const SETTLED_STATUSES = [
+  "executed",
+  "failed",
+  "rejected",
+  "expired",
+] as const satisfies readonly ActionApprovalStatus[];
+type SettledStatus = (typeof SETTLED_STATUSES)[number];
+
+const isSettledStatus = (status: string): status is SettledStatus =>
+  (SETTLED_STATUSES as readonly string[]).includes(status);
+
 const OUTCOME_LINES: Record<
-  Exclude<ActionApprovalStatus, "pending" | "approved">,
+  SettledStatus,
   (summary: string, detail: string | null) => string
 > = {
-  executed: (summary) => `Approved and done: ${summary}.`,
+  executed: (summary, note) =>
+    note
+      ? `Approved and done: ${summary}. ${note}`
+      : `Approved and done: ${summary}.`,
   rejected: (summary, reason) =>
     reason
       ? `Rejected: ${summary}. The reason given: "${reason}" - adjust and ask again if it still matters.`
@@ -584,6 +688,82 @@ const OUTCOME_LINES: Record<
   expired: (summary) =>
     `Expired unanswered: ${summary}. Nobody decided in time - ask again if it still matters.`,
 };
+
+/**
+ * The turn-start APPROVAL-OUTCOME note: every held action asked from THIS
+ * conversation that was decided (or expired) since the model last ran here,
+ * plus the asks still waiting. The `send_message`/`message_agent` tool
+ * results promise the decision "arrives as a notice"; the durable notice
+ * row is what the person sees in the transcript, and this note is the half
+ * the MODEL reads. Without it the agent kept answering "still waiting for
+ * approval" about a message that had already been delivered.
+ *
+ * The window is (the previous turn the model RAN started, now]. "Ran" is
+ * the harness's own `turn.started` row: a report turn the platform wrote
+ * (an automation delivery, a peer task's close) or a follow-up folded into
+ * another run never reached the model, so it must not move the window.
+ * `now` is dispatch time (this builder runs at dispatch), so a decision
+ * landing while this turn sat in the queue is still news for it. No stored
+ * "seen" flag: a decision is news for one run, and the next run's window
+ * starts after it.
+ *
+ * Delivery-only context (the same law as the mention note): composed from
+ * current truth at dispatch, never stored; the caller isolates failure.
+ */
+export const buildApprovalOutcomeNote = async (
+  conversationId: string,
+  turnCreatedAt: Date,
+): Promise<string | null> => {
+  // `startedAt` is written with the `turn.started` row (same transaction,
+  // the app clock that also stamps `updatedAt` below).
+  const since = await previousRunStartedAt(conversationId, turnCreatedAt);
+  if (!since) return null;
+  const now = new Date();
+
+  const [settled, waiting] = await Promise.all([
+    db.actionApproval.findMany({
+      where: {
+        conversationId,
+        status: { in: [...SETTLED_STATUSES] },
+        updatedAt: { gt: since, lte: now },
+      },
+      orderBy: { updatedAt: "desc" },
+      take: APPROVAL_NOTE_MAX_ROWS,
+      select: { status: true, summary: true, reason: true },
+    }),
+    // Only asks an owner can still decide: an expired row the sweep has
+    // not parked yet is not "waiting" (it reads as expired once parked).
+    db.actionApproval.findMany({
+      where: { conversationId, status: "pending", expiresAt: { gt: now } },
+      orderBy: { createdAt: "desc" },
+      take: APPROVAL_NOTE_MAX_ROWS,
+      select: { summary: true },
+    }),
+  ]);
+
+  // Newest rows win the cap; the note reads oldest first.
+  const lines = [
+    ...settled
+      .reverse()
+      .flatMap((a) =>
+        isSettledStatus(a.status)
+          ? [OUTCOME_LINES[a.status](a.summary, a.reason)]
+          : [],
+      ),
+    ...waiting
+      .reverse()
+      .map((a) => `Still waiting for the owner's decision: ${a.summary}.`),
+  ];
+  if (lines.length === 0) return null;
+  return [
+    "Approval updates for actions you asked for in this conversation (current truth; trust these over your earlier replies):",
+    ...lines.map((line) => `- ${line}`),
+  ].join("\n");
+};
+
+/** Bounds the note: a conversation that asked for dozens of sends still
+ * gets a context block, not a flood. */
+const APPROVAL_NOTE_MAX_ROWS = 10;
 
 /**
  * Settle every posted card and write the durable outcome notice on the

@@ -48,17 +48,28 @@ export interface AttachCardProps {
   removed: boolean;
   identityName: string | null;
   /**
-   * The removed presence's provider-side app id, so a re-attach face can
-   * point at THAT app instead of walking the first-time setup again. Null
-   * unless `removed`.
+   * The provider-side app id of the presence a re-attach would resume (a
+   * detached or half-finished setup, or an app removed on the provider's
+   * side), so the attach face can point at THAT app instead of walking the
+   * first-time setup again. Null unless `resuming`.
    */
-  removedAppId: string | null;
+  resumeAppId: string | null;
+  /**
+   * The resumable presence was installed by consent and waits only for its
+   * transport credential (the provider's own paste, e.g. Slack's app-level
+   * token). The server decides this from credentials the browser never sees.
+   */
+  awaitingTransportCredential: boolean;
 }
 
 export interface ChannelProviderUi extends ChannelProviderDisplay {
   id: string;
   PresenceCard: ComponentType<PresenceCardProps>;
   AttachCard: ComponentType<AttachCardProps>;
+  /** Optional, licensed (granular_access): the "connect your account and
+   * share conversations" card shown under a connected presence. Rendered
+   * only when the instance is entitled. */
+  ReadAccessCard?: ComponentType<{ agentId: string; agentName: string }>;
 }
 
 /**

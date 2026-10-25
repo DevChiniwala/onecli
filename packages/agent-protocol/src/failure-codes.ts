@@ -56,12 +56,20 @@
  *   `harness_busy`: the raw message rides beside it.
  * - `transcript_rejected`: the harness lived and the key was fine, but the
  *   model provider rejected the CONVERSATION as malformed (a `tool_use` not
- *   answered by its `tool_result`). The stored transcript is replayed whole
- *   on every turn, so every resend fails identically until it is repaired
- *   (issue #1194: a container stop tore the harness's checkpoint and doubled
- *   the history; the jcode adapter repairs that shape at its next boot).
+ *   answered by its `tool_result`, or an image in a media type the provider
+ *   does not accept). The stored transcript is replayed whole on every turn,
+ *   so every resend fails identically until it is repaired (issue #1194: a
+ *   container stop tore the harness's checkpoint and doubled the history;
+ *   the jcode adapter repairs both shapes at its next boot).
  *   Classified by the supervisor from the provider's wording; same
  *   version-skew posture as `harness_busy`: the raw message rides beside it.
+ * - `model_endpoint_not_found`: the harness lived, but the model endpoint
+ *   answered 404 (an unknown model name, a wrong endpoint address, a proxy
+ *   in front of the provider forwarding to a path it does not serve). Setup:
+ *   a new key never fixes it and a resend only helps a one-off misroute, so
+ *   the copy points at whoever operates the agent. Classified by the
+ *   supervisor from the harness's model-API error wrapper; the raw message
+ *   rides beside it.
  */
 export const TURN_FAILURE_CODES = {
   agentRestarted: "agent_restarted",
@@ -71,6 +79,7 @@ export const TURN_FAILURE_CODES = {
   harnessBusy: "harness_busy",
   harnessNoTerminal: "harness_no_terminal",
   transcriptRejected: "transcript_rejected",
+  modelEndpointNotFound: "model_endpoint_not_found",
 } as const;
 export type TurnFailureCode =
   (typeof TURN_FAILURE_CODES)[keyof typeof TURN_FAILURE_CODES];

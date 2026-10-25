@@ -13,6 +13,12 @@ pub const FLUSH_BATCH_SIZE: usize = 500;
 pub const CHANNEL_CAPACITY: usize = 10_000;
 const MAX_PATH_LEN: usize = 2048;
 
+/// What a [`RequestDecision::DestinationRefused`] row is attributed to in the
+/// activity feed's "Blocked by" slot. Not a policy rule: the destination
+/// guard is fixed behavior, so the name says so instead of pretending a
+/// rule exists.
+pub const DESTINATION_GUARD_RULE_NAME: &str = "Non-public destination";
+
 #[allow(dead_code)] // variants read by cloud telemetry (extra_data), unused in OSS
 pub enum RequestDecision {
     Allowed,
@@ -52,6 +58,22 @@ pub enum RequestDecision {
     /// `error` is the guidance error code the agent received.
     NeedsConnection {
         error: String,
+    },
+    /// The destination guard refused the request: the host resolved only to
+    /// non-public addresses the operator has not allowed (`proxy::egress`).
+    /// Nothing was dialed. Its own variant so the activity feed shows the
+    /// refusal as a block attributed to the guard, not a plain 403.
+    DestinationRefused,
+    /// An open-lane CONNECT (`proxy::tunnel`): the client's bytes were relayed
+    /// to the host untouched, so there was no request to log; this is the
+    /// one row the tunnel leaves, written when it closes, with how much
+    /// crossed in each direction. Its own variant so `keeps_event` persists
+    /// it: an un-injected `Allowed` row is dropped by design, and a tunnel
+    /// that left no trace would be the open relay the token check exists to
+    /// prevent.
+    Tunneled {
+        bytes_up: u64,
+        bytes_down: u64,
     },
 }
 

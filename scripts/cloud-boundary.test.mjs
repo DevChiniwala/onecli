@@ -21,6 +21,7 @@ const CLOUD_ONLY_PACKAGES = [
   "apps/sandbox-home-device",
   "apps/sandbox-home-daemon",
   "apps/sandbox-log-shipper",
+  "apps/preview-relay",
   "packages/sandbox-home-device-proto",
   "packages/sandbox-shared",
 ];
@@ -88,22 +89,31 @@ test(
  * rule): generic words like "pod", "S3" or "load balancer" are legitimate in
  * shared prose and are left to review. Every entry was checked against the
  * whole synced tree for false positives when it was added.
+ *
+ * Plain Kubernetes vocabulary (kubelet, PVC, ServiceAccount, ResourceQuota,
+ * EKS as a platform name, Kata as a RuntimeClass, an ALB fronting the
+ * chart's Gateway) is NOT in this list: the synced Helm chart and the
+ * runner's kubernetes backend describe a self-hoster's own cluster in those
+ * words. What stays cloud-only is the cloud's own machinery (the sandbox
+ * platform, its stacks, its AWS services).
+ *
+ * The NLB (spelled out too), its IP-target registration, "on dev" notes and
+ * the private tracker's issue numbers ARE listed: no synced file needs them
+ * (the chart fronts its Gateway with an ALB), so a hit is always a hosted
+ * deployment's own detail, its dev environment, or an issue the public mirror
+ * cannot open. Issue numbers are listed one by one as they are scrubbed. A
+ * `jcode#623`-style qualified reference names a public upstream issue and is
+ * never matched.
  */
 const CLOUD_IMPLEMENTATION_TERMS = [
-  /\bkata\b/i,
   /\bmicro-?vms?\b/i,
   /\bublk\b/i,
-  /\bkubelet\b/i,
   /\bkarpenter\b/i,
   /\btopolvm\b/i,
-  /\b(eks|irsa|fargate|ecs)\b/i,
+  /\b(irsa|fargate|ecs)\b/i,
   /\bcloudfront\b/i,
   /\belasticache\b/i,
   /\bcloudwatch\b/i,
-  /\b(nlb|alb)\b/i,
-  /\bpvcs?\b/i,
-  /\bresourcequota\b/i,
-  /\bserviceaccount\b/i,
   /\bkube-root-ca\b/i,
   /\btwingate\b/i,
   /\bsandbox[- ]manager\b/i,
@@ -123,6 +133,16 @@ const CLOUD_IMPLEMENTATION_TERMS = [
   /\bdeploy(-infra|-sandbox-platform|-analytics)?\.yml\b/,
   /\bdev live gate\b/i,
   /\bobserved on dev\b/i,
+  /\bnlb\b/i,
+  /\bnetwork load balancer\b/i,
+  /\bip-target registration\b/i,
+  /\b(found|seen) (live )?on dev\b|\b(after boot|ran) on dev\b|\bdev ran on\b|\bon dev:/i,
+  /#1300\b/,
+  /(^|[^\w#&])#(803|1335|1401)\b/,
+  // The hosted agent desktop is licensed hosted-platform code: its plan and
+  // the screen server it runs are named only inside ee/ and cloud-only dirs.
+  /\bplans\/desktop-takeover\b/,
+  /\bx0?tigervnc\b/i,
 ];
 
 /** Synced files whose prose may name these terms by design. */
@@ -276,6 +296,12 @@ test(
       } catch {
         continue;
       }
+      // Raw-text prefilter, identical in result: every comment row is a
+      // substring of the source whose edges sit next to a non-word character
+      // there (a comment marker, a newline, `*/`), so a term that matches a
+      // row matches the source too. Only the few files that name a term
+      // anywhere pay for the TypeScript parse.
+      if (!CLOUD_IMPLEMENTATION_TERMS.some((re) => re.test(source))) continue;
       for (const { line, text } of await commentsOf(file, source)) {
         const hit = CLOUD_IMPLEMENTATION_TERMS.find((re) => re.test(text));
         if (hit)
@@ -302,12 +328,14 @@ test(
     // comment is found, the same term inside a string literal is not.
     const rows = await commentsOf(
       "x.ts",
-      'const a = "kata";\n// boots under Kata on EKS\nconst b = `sandbox-manager ${a}`;\n',
+      'const a = "fargate";\n// boots under Fargate\nconst b = `sandbox-manager ${a}`;\n' +
+        'const c = "behind the NLB";\n// Found live on dev: behind the NLB\n',
     );
     const flagged = rows.filter(({ text }) =>
       CLOUD_IMPLEMENTATION_TERMS.some((re) => re.test(text)),
     );
-    assert.equal(flagged.length, 1);
+    assert.equal(flagged.length, 2);
     assert.equal(flagged[0].line, 2);
+    assert.equal(flagged[1].line, 5);
   },
 );

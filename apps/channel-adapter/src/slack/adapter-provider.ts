@@ -2,6 +2,7 @@ import { escapeSlackText } from "@onecli/channels/slack";
 import type { AdapterPresence } from "@onecli/agent-protocol";
 import type {
   ChannelAdapterProvider,
+  GroupApprovalDecision,
   ProviderOutcomeContext,
   ProviderTransport,
   ProviderTransportHandlers,
@@ -9,8 +10,12 @@ import type {
 import { slackApprovalCardUi } from "./approval-card";
 import { isDeadCredentialError } from "@onecli/channels";
 import {
+  followUpActionClickOf,
+  groupClickOf,
+  postEphemeral,
   postMessage,
   SlackApiError,
+  turnStopClickOf,
   unpackThreadAddress,
 } from "@onecli/channels/slack";
 import { botTokenOf } from "./credentials";
@@ -72,6 +77,34 @@ const approvalDecisionOf = (
     approvalId: action.value,
     decision: action.action_id === "channel_approve" ? "approve" : "deny",
     clickerExternalUserId: clicker,
+  };
+};
+
+/** A GROUPED approval card's click (shared vocabulary: group-card.ts in
+ * @onecli/channels/slack, which the control plane's HTTP arm also reads). */
+const groupApprovalDecisionOf = (
+  payload: Record<string, unknown>,
+): GroupApprovalDecision | null => {
+  const typed = payload as {
+    type?: string;
+    user?: { id?: string };
+    channel?: { id?: string };
+    container?: { channel_id?: string };
+    actions?: {
+      action_id?: string;
+      value?: string;
+      selected_option?: { value?: string };
+    }[];
+  };
+  const action = typed.actions?.[0];
+  const clicker = typed.user?.id;
+  if (typed.type !== "block_actions" || !action || !clicker) return null;
+  const click = groupClickOf(action);
+  if (!click) return null;
+  return {
+    ...click,
+    clickerExternalUserId: clicker,
+    channel: typed.channel?.id ?? typed.container?.channel_id ?? null,
   };
 };
 
@@ -177,6 +210,11 @@ const openTransport = (
     {
       onEvent: handlers.onEvent,
       onInteractive: (payload) => {
+        const group = groupApprovalDecisionOf(payload);
+        if (group) {
+          handlers.onGroupApprovalDecision(group);
+          return;
+        }
         const decision = approvalDecisionOf(payload);
         if (decision) {
           handlers.onApprovalDecision(decision);
@@ -188,7 +226,29 @@ const openTransport = (
           return;
         }
         const action = actionDecisionOf(payload);
-        if (action) handlers.onActionDecision(action);
+        if (action) {
+          handlers.onActionDecision(action);
+          return;
+        }
+        const cardStop = turnStopClickOf(payload);
+        if (cardStop) {
+          handlers.onCardStop({
+            channel: cardStop.channel,
+            cardTs: cardStop.messageTs,
+            clickerExternalUserId: cardStop.clickerExternalUserId,
+          });
+          return;
+        }
+        const rowAction = followUpActionClickOf(payload);
+        if (rowAction) {
+          handlers.onCardFollowUpAction({
+            channel: rowAction.channel,
+            cardTs: rowAction.messageTs,
+            clickerExternalUserId: rowAction.clickerExternalUserId,
+            action: rowAction.action,
+            followUpId: rowAction.followUpId,
+          });
+        }
       },
       onPermanentFailure: handlers.onPermanentFailure,
       onLog: (message, detail) =>
@@ -224,6 +284,21 @@ const respondToOutcome = async ({
     return;
   }
   if (outcome.kind === "ignored" || outcome.kind === "duplicate") return;
+  if (outcome.kind === "stop") {
+    // A refused Stop: a note only the clicker sees, in the thread they
+    // clicked in. Everything else about a Stop is already done (the abort,
+    // the loader settle) and the close posts "Stopped." on its own.
+    const notice = outcome.notice;
+    if (notice) {
+      await postEphemeral(credential, {
+        channel: notice.channel,
+        threadTs: notice.threadTs,
+        user: notice.user,
+        text: escapeSlackText(notice.message),
+      }).catch((err: unknown) => onLog("stop notice post failed", { err }));
+    }
+    return;
+  }
 
   const reply = outcome.reply;
   if (!reply) return;
@@ -294,6 +369,13 @@ export const slackAdapterProvider: ChannelAdapterProvider = {
   openTransport,
   respondToOutcome,
   decisionSettledText,
+  notifyClicker: async ({ credential, channel, user, text, onLog }) => {
+    await postEphemeral(credential, {
+      channel,
+      user,
+      text: escapeSlackText(text),
+    }).catch((err: unknown) => onLog("clicker notice post failed", { err }));
+  },
   posts: slackMirrorPosts,
   cardUi: slackApprovalCardUi,
   removalEventFor,

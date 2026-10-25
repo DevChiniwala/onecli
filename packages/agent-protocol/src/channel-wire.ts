@@ -1,4 +1,9 @@
 import { z } from "zod";
+import {
+  APPROVAL_GROUP_ID_RE,
+  APPROVAL_GROUP_MAX_IDS,
+  FOLLOW_UP_ACTIONS,
+} from "@onecli/channels";
 
 /**
  * The CHANNEL-ADAPTER ↔ control-plane wire (hosted-agents v2 step 6).
@@ -81,6 +86,18 @@ export const adapterPresenceSchema = z.object({
   /** The gateway approvals key for this presence. */
   approvalsKey: z.string().nullable(),
   links: z.array(adapterLinkSchema),
+  /**
+   * Where this presence's tool-approval cards go: the id of the link to the
+   * approver's OWN direct thread (the owner of the presence's service key,
+   * the identity the approvals are decided as). Never a guest's DM or a
+   * group thread: a guest can be allowed to TALK to the agent without being
+   * able to approve what it does. Null = the approver has no DM with the
+   * agent yet, so no card is posted (the approval stays decidable on the
+   * web).
+   * Optional: an older control plane never sends it, and the adapter then
+   * keeps its legacy first-direct-link behavior.
+   */
+  approvalsLinkId: z.string().nullable().optional(),
 });
 export type AdapterPresence = z.infer<typeof adapterPresenceSchema>;
 
@@ -151,13 +168,19 @@ export const adapterWorkItemSchema = z.object({
   /**
    * Mid-run follow-ups this turn CONSUMED (`joined`), oldest first. The
    * mirror posts the web-sourced ones ahead of the answer so the provider
-   * thread shows the same exchange the web does; provider-sourced ones are
-   * already in the channel. Optional: an older control plane simply never
-   * sends it.
+   * thread shows the same exchange the web does (an automation's, i.e. a
+   * wake that joined a running wake, as its caption, never as a person's
+   * words); provider-sourced ones are already in the channel. Each one's
+   * own reply, when the agent wrote one, posts right after it. Optional: an
+   * older control plane simply never sends it.
    */
   followUps: z
     .array(
       z.object({
+        /** The follow-up's own turn id: where its reply is stored in the
+         * transcript. Optional: an older control plane never sends it, and
+         * the mirror then posts no reply (the pre-field behavior). */
+        id: z.string().optional(),
         message: z.string(),
         source: z.string(),
         /** Display name of THIS follow-up's author — on a group thread it
@@ -165,6 +188,16 @@ export const adapterWorkItemSchema = z.object({
          * never sends it (consumers fall back to the turn's name). Null: the
          * control plane resolved and found nothing (deleted user). */
         userName: z.string().nullable().optional(),
+        /** Where THIS follow-up was asked, when finer than the link's own
+         * address: its reply is posted there (the turn's `sourceThreadId`
+         * rule, per message). Optional/nullable for version skew. */
+        sourceThreadId: z.string().nullable().optional(),
+        /** Whether this follow-up's reply was ALREADY posted, mid-run, by
+         * the reply feed (`replies`): the completion pass then posts the
+         * follow-up's words (when they came from elsewhere) but not the
+         * reply again. Optional: an older control plane never sends it,
+         * and never served a reply early either. */
+        replyPosted: z.boolean().optional(),
       }),
     )
     .optional(),
@@ -178,10 +211,59 @@ export const adapterWorkItemSchema = z.object({
 });
 export type AdapterWorkItem = z.infer<typeof adapterWorkItemSchema>;
 
+/**
+ * A reply the agent wrote to a mid-run follow-up of a turn STILL RUNNING,
+ * not yet posted to the provider. Everything the mirror needs to post it
+ * where the follow-up was asked, without a transcript read of its own: the
+ * reply text travels with the item, and so do the follow-up's own words and
+ * author, because a follow-up typed on ANOTHER surface (the web) is not in
+ * the channel yet and must post ahead of its reply, as one exchange.
+ */
+export const adapterReplyItemSchema = z.object({
+  linkId: z.string(),
+  presenceId: z.string(),
+  conversationId: z.string(),
+  /** The link's own address: the channel the reply posts in. */
+  externalThreadId: z.string(),
+  kind: z.enum(["direct", "group"]),
+  /** The running turn the follow-up joined. */
+  turnId: z.string(),
+  followUp: z.object({
+    id: z.string(),
+    /** The follow-up's words, as the completion pass would mirror them. */
+    message: z.string(),
+    source: z.string(),
+    /** The author's display name (null: unnamed), for the attribution line
+     * of a follow-up from another surface. */
+    userName: z.string().nullable(),
+    /** Where the follow-up was asked, when finer than the link's address. */
+    sourceThreadId: z.string().nullable(),
+  }),
+  /** The agent's reply, as stored under the follow-up. */
+  reply: z.string(),
+});
+export type AdapterReplyItem = z.infer<typeof adapterReplyItemSchema>;
+
 export const adapterWorkResponseSchema = z.object({
   finished: z.array(adapterWorkItemSchema),
+  /**
+   * Replies the agent has ALREADY written to mid-run follow-ups of turns
+   * still running, not yet posted to the provider: the mirror posts each
+   * one the moment it sees it (claim first, then post), so a person who
+   * asked while the agent worked reads the answer while the agent still
+   * works. Optional: an older control plane never sends it, and every
+   * reply then posts at the turn's close as before.
+   */
+  replies: z.array(adapterReplyItemSchema).optional(),
 });
 export type AdapterWorkResponse = z.infer<typeof adapterWorkResponseSchema>;
+
+/** The claim on a follow-up's reply, before it posts: exactly-once by a
+ * compare-and-set on the row (NULL to now). */
+export const adapterReplyClaimSchema = z.object({
+  followUpId: z.string(),
+});
+export type AdapterReplyClaim = z.infer<typeof adapterReplyClaimSchema>;
 
 // ── Ingest (raw provider event → door outcome) ──────────────────────────────
 
@@ -244,6 +326,23 @@ export const adapterIngestResponseSchema = z.discriminatedUnion("kind", [
     message: z.string().nullable(),
     channel: z.string().nullable(),
   }),
+  /**
+   * The provider's native Stop on a thread's loader. The control plane has
+   * already done everything shared (the abort, the loader settle); what is
+   * left is request-scoped: a refused clicker is owed a note only THEY see,
+   * in the thread they clicked in. Null = nothing to say (stopped, or idle).
+   */
+  z.object({
+    kind: z.literal("stop"),
+    notice: z
+      .object({
+        channel: z.string(),
+        threadTs: z.string(),
+        user: z.string(),
+        message: z.string(),
+      })
+      .nullable(),
+  }),
 ]);
 export type AdapterIngestResponse = z.infer<typeof adapterIngestResponseSchema>;
 
@@ -267,6 +366,39 @@ export const adapterDecisionResponseSchema = z.discriminatedUnion("kind", [
 ]);
 export type AdapterDecisionResponse = z.infer<
   typeof adapterDecisionResponseSchema
+>;
+
+/** A grouped card's click: Approve all / Deny all, or one row. The ids are
+ *  exactly the rows the card showed, in the shared grouped-approval id shape
+ *  and cap (@onecli/channels approval-group); the control plane refuses the
+ *  whole click unless every id is one of THIS presence's posted cards. */
+export const adapterGroupDecisionRequestSchema = z.object({
+  presenceId: z.string().min(1),
+  approvalIds: z
+    .array(z.string().regex(APPROVAL_GROUP_ID_RE))
+    .min(1)
+    .max(APPROVAL_GROUP_MAX_IDS),
+  decision: z.enum(["approve", "deny"]),
+  clickerExternalUserId: z.string().min(1).max(200),
+});
+export type AdapterGroupDecisionRequest = z.infer<
+  typeof adapterGroupDecisionRequestSchema
+>;
+
+export const adapterGroupDecisionResponseSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("decided"),
+    decidedByName: z.string(),
+    decided: z.array(z.string()),
+    alreadySettled: z.array(z.string()),
+    /** Still pending (the gateway call failed): the card keeps them. */
+    failed: z.array(z.string()),
+  }),
+  z.object({ kind: z.literal("refused"), message: z.string() }),
+  z.object({ kind: z.literal("unavailable"), message: z.string() }),
+]);
+export type AdapterGroupDecisionResponse = z.infer<
+  typeof adapterGroupDecisionResponseSchema
 >;
 
 // ── Reach grants (space grants: "answer everyone in this channel") ─────────
@@ -335,6 +467,70 @@ export type AdapterActionDecisionResponse = z.infer<
   typeof adapterActionDecisionResponseSchema
 >;
 
+// ── Card Stop (the narration card's own Stop button) ──────────────────────────
+
+/**
+ * A Stop pressed on the narration card, relayed by the socket arm. Carries
+ * only where the provider says the card sits and who pressed it; the
+ * control plane resolves the turn whose LIVE card that is on this presence
+ * and authorizes the clicker itself.
+ */
+export const adapterCardStopRequestSchema = z.object({
+  presenceId: z.string().min(1),
+  channel: z.string().min(1).max(200),
+  cardTs: z.string().min(1).max(200),
+  clickerExternalUserId: z.string().min(1).max(200),
+});
+export type AdapterCardStopRequest = z.infer<
+  typeof adapterCardStopRequestSchema
+>;
+
+/** `refused` is owed to the clicker alone (the adapter posts it
+ * ephemerally); `stopped` / `idle` owe nothing (the turn's close replaces
+ * the card with "Stopped."). */
+export const adapterCardStopResponseSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("stopped") }),
+  z.object({ kind: z.literal("idle") }),
+  z.object({ kind: z.literal("refused"), message: z.string() }),
+]);
+export type AdapterCardStopResponse = z.infer<
+  typeof adapterCardStopResponseSchema
+>;
+
+// ── Card row action (a control on a waiting message's row of the card) ───────
+
+/**
+ * A control pressed on a waiting message's row of the narration card,
+ * relayed by the socket arm: where the provider says the card sits, which
+ * row was pressed, and who pressed it. The row id is a pointer the control
+ * plane checks against the card's own turn, never an authority.
+ */
+export const adapterCardFollowUpActionRequestSchema = z.object({
+  presenceId: z.string().min(1),
+  channel: z.string().min(1).max(200),
+  cardTs: z.string().min(1).max(200),
+  clickerExternalUserId: z.string().min(1).max(200),
+  action: z.enum(FOLLOW_UP_ACTIONS),
+  followUpId: z.string().min(1).max(200),
+});
+export type AdapterCardFollowUpActionRequest = z.infer<
+  typeof adapterCardFollowUpActionRequestSchema
+>;
+
+/** `refused` is owed to the clicker alone (the adapter posts it
+ * ephemerally); `done` owes nothing (the row leaves the card once the agent
+ * reads the message). */
+export const adapterCardFollowUpActionResponseSchema = z.discriminatedUnion(
+  "kind",
+  [
+    z.object({ kind: z.literal("done") }),
+    z.object({ kind: z.literal("refused"), message: z.string() }),
+  ],
+);
+export type AdapterCardFollowUpActionResponse = z.infer<
+  typeof adapterCardFollowUpActionResponseSchema
+>;
+
 export const adapterPromptClaimResponseSchema = z.object({
   claimed: z.boolean(),
 });
@@ -355,6 +551,11 @@ export const adapterUnsettledPromptsResponseSchema = z.object({
 
 export const adapterCursorResponseSchema = z.object({
   advanced: z.boolean(),
+});
+
+/** The answer to a reply claim: true on the winning compare-and-set. */
+export const adapterReplyClaimResponseSchema = z.object({
+  claimed: z.boolean(),
 });
 
 // ── Outbound mentions (the completion pass's name resolution) ───────────────
