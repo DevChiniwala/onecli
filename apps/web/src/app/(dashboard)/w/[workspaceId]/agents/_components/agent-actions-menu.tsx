@@ -3,11 +3,11 @@
 import { useState } from "react";
 import {
   MoreHorizontal,
-  RotateCw,
+  RefreshCcw,
   Trash2,
-  KeyRound,
   Pencil,
   Info,
+  History,
 } from "lucide-react";
 import { Button } from "@onecli/ui/components/button";
 import { Input } from "@onecli/ui/components/input";
@@ -39,10 +39,11 @@ import {
 } from "@onecli/ui/components/dialog";
 import {
   useDeleteAgent,
-  useRegenerateToken,
   useRenameAgent,
+  useRestartAgent,
 } from "@/hooks/use-agents";
 import { providerLabel } from "@/lib/agents/channel-provider-ui";
+import type { AgentKind } from "@/lib/api/types";
 
 /**
  * "Slack app (@donna)" — the handle a human sees in the workspace, so the
@@ -64,6 +65,9 @@ interface AgentActionsMenuProps {
   agent: {
     id: string;
     name: string;
+    /** "hosted" agents get "Restart agent": only they have a computer and
+     * conversations to restart. */
+    kind: AgentKind;
     /** Attached channel presences — deletion removes these from the
      * customer's workspace, so the confirmation names them. */
     channels?: {
@@ -72,12 +76,11 @@ interface AgentActionsMenuProps {
       externalId?: string;
     }[];
   };
-  /** The owner renders the credential-access reflection dialog (the card also
-   * opens it from an inline button, so the dialog cannot live in the menu). */
-  onCredentialAccess: () => void;
   /** The agent page's "Details" entry: the agent's facts as a dialog. Omitted
    * by the list card, whose row already shows them. */
   onDetails?: () => void;
+  /** Open Activity narrowed to this agent (its runs and requests). */
+  onViewActivity?: () => void;
   /** Detail-page hook: navigate away after a successful delete. */
   onDeleted?: () => void;
 }
@@ -86,14 +89,14 @@ interface AgentActionsMenuProps {
  * detail page header, so the action set can never drift between them. */
 export const AgentActionsMenu = ({
   agent,
-  onCredentialAccess,
   onDetails,
+  onViewActivity,
   onDeleted,
 }: AgentActionsMenuProps) => {
   const deleteMutation = useDeleteAgent();
-  const regenerateMutation = useRegenerateToken();
   const renameMutation = useRenameAgent();
-  const [rotateDialogOpen, setRotateDialogOpen] = useState(false);
+  const restartMutation = useRestartAgent();
+  const [restartDialogOpen, setRestartDialogOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [renameDialogOpen, setRenameDialogOpen] = useState(false);
   const [newName, setNewName] = useState("");
@@ -114,7 +117,10 @@ export const AgentActionsMenu = ({
       return next;
     });
 
-  const handleRegenerate = () => regenerateMutation.mutate(agent.id);
+  const handleRestart = () =>
+    restartMutation.mutate(agent.id, {
+      onSuccess: () => setRestartDialogOpen(false),
+    });
 
   const handleDelete = () =>
     deleteMutation.mutate(agent.id, { onSuccess: () => onDeleted?.() });
@@ -143,6 +149,12 @@ export const AgentActionsMenu = ({
               Details
             </DropdownMenuItem>
           )}
+          {onViewActivity && (
+            <DropdownMenuItem onSelect={onViewActivity}>
+              <History className="size-4" />
+              View activity
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem
             onSelect={() => {
               setNewName(agent.name);
@@ -152,14 +164,12 @@ export const AgentActionsMenu = ({
             <Pencil className="size-4" />
             Rename
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={onCredentialAccess}>
-            <KeyRound className="size-4" />
-            Credential access
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setRotateDialogOpen(true)}>
-            <RotateCw className="size-4" />
-            Rotate token
-          </DropdownMenuItem>
+          {agent.kind === "hosted" && (
+            <DropdownMenuItem onSelect={() => setRestartDialogOpen(true)}>
+              <RefreshCcw className="size-4" />
+              Restart agent
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem
             variant="destructive"
@@ -171,23 +181,43 @@ export const AgentActionsMenu = ({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <AlertDialog open={rotateDialogOpen} onOpenChange={setRotateDialogOpen}>
+      <AlertDialog open={restartDialogOpen} onOpenChange={setRestartDialogOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Rotate token?</AlertDialogTitle>
-            <AlertDialogDescription>
-              The current token for <strong>{agent.name}</strong> will be
-              invalidated immediately. Any agents using the old token will lose
-              access.
+            <AlertDialogTitle>Restart agent?</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3">
+                <p>
+                  <strong>{agent.name}</strong> starts fresh in every
+                  conversation, in the dashboard
+                  {channels
+                    .map((c) => ` and in ${providerLabel(c.provider)}`)
+                    .join("")}
+                  . The chat history stays visible, but the agent won&apos;t
+                  remember it.
+                </p>
+                <p>
+                  Anything it&apos;s working on stops now, including background
+                  processes and open SSH sessions. Your next message starts it
+                  again.
+                </p>
+              </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={restartMutation.isPending}>
+              Cancel
+            </AlertDialogCancel>
             <AlertDialogAction
-              onClick={handleRegenerate}
-              disabled={regenerateMutation.isPending}
+              onClick={(e) => {
+                // Close on success only: a failed restart leaves the dialog
+                // up, so the person sees it did not happen.
+                e.preventDefault();
+                handleRestart();
+              }}
+              disabled={restartMutation.isPending}
             >
-              {regenerateMutation.isPending ? "Rotating..." : "Rotate"}
+              {restartMutation.isPending ? "Restarting..." : "Restart"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

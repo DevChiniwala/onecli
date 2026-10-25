@@ -1,6 +1,7 @@
 import {
   bareToolName,
   isInlineableImage,
+  isPlatformSteerId,
   isTerminalEvent,
   INLINE_IMAGES_TOTAL_MAX_BYTES,
   MAX_TURN_RESULT_ERROR_CHARS,
@@ -8,6 +9,7 @@ import {
   TURN_FAILURE_CODES,
   type AgentConnectionWire,
   type AttachmentManifestEntry,
+  type BackgroundedTool,
   type Harness,
   type HarnessSession,
   type SupervisorTransport,
@@ -16,9 +18,16 @@ import {
   type WorkItem,
 } from "@onecli/agent-protocol";
 import type { SupervisorConfig } from "./config";
+import {
+  createAnswerTracker,
+  MAX_ANSWER_CHARS,
+  replyTargetOf,
+  toWireEvent,
+} from "./answer";
 import { log } from "./log";
 import {
   isProviderRefusal,
+  isModelEndpointNotFound,
   isTranscriptRejected,
   isTrialCreditExhausted,
 } from "./provider-refusal";
@@ -33,14 +42,27 @@ import { startPlatformTools } from "./platform-tools";
 import { attachmentsFragment } from "./capabilities/attachments";
 import { agentsTools } from "./capabilities/agents";
 import { channelsChangeNote, channelsTools } from "./capabilities/channels";
-import { connectionsFragment } from "./capabilities/connections";
+import {
+  connectionsChangeNote,
+  connectionsFragment,
+  connectionsTools,
+} from "./capabilities/connections";
 import { cronsFragment, cronsTools } from "./capabilities/crons";
+import { webhooksFragment, webhooksTools } from "./capabilities/webhooks";
 import {
   createSendFileTools,
   sendFileFragment,
 } from "./capabilities/send-file";
+import {
+  reservedGuestPorts,
+  createPortStreams,
+  isPortWorkItem,
+} from "./capabilities/port-streams";
+import { startPortDiscovery } from "./capabilities/port-discovery";
+import type { SupervisorAddon, SupervisorAddonHost } from "./addons";
 import { machineFragment } from "./capabilities/machine";
 import { memoryFragment, memoryTools } from "./capabilities/memory";
+import { previewsFragment, previewsTools } from "./capabilities/previews";
 import { skillsFragment, skillsTools } from "./capabilities/skills";
 import {
   createProcessTools,
@@ -72,15 +94,6 @@ import {
  * cost was measured for; turns of the SAME conversation stay serialized,
  * mirroring the control plane's one-active-turn law.
  */
-
-/**
- * Memory guard on a single turn's accumulated answer. Not a product limit —
- * the wire applies the visible one — just the point past which a runaway
- * model stops being allowed to grow this process's heap. Two segments are
- * live at once (the current one and the never-silent fallback), so the true
- * ceiling is 2× this — still bounded, which is the whole point.
- */
-export const MAX_ANSWER_CHARS = 256_000;
 
 /**
  * Cadence of the turn-liveness heartbeat (`progress` frames). Comfortably
@@ -121,20 +134,24 @@ const TOOL_REGISTRATION_SETTLE_MS = 1_000;
 
 /**
  * The signal path (index.ts) exits immediately without running the loop's
- * `finally`, so a running supervisor registers a synchronous cleanup here
- * that the handler can call before `process.exit` — today, SIGTERM'ing every
- * background process group so children get their flush chance. A plain
- * module-level hook avoids threading the manager up into index.ts.
+ * `finally`, so a running supervisor registers synchronous cleanups here
+ * that the handler runs before `process.exit`: SIGTERM'ing every background
+ * process group so children get their flush chance, and taking the desktop
+ * down. A plain module-level hook avoids threading the manager up into
+ * index.ts. Each registration is kept (never replaced): the pieces that
+ * need a last word are started by different modules.
  */
-let signalCleanup: (() => void) | null = null;
+const signalCleanups: (() => void)[] = [];
 export const registerSignalCleanup = (fn: () => void): void => {
-  signalCleanup = fn;
+  signalCleanups.push(fn);
 };
 export const runSignalCleanup = (): void => {
-  try {
-    signalCleanup?.();
-  } catch {
-    // best-effort: the container is about to die regardless
+  for (const fn of signalCleanups) {
+    try {
+      fn();
+    } catch {
+      // best-effort: the container is about to die regardless
+    }
   }
 };
 
@@ -144,7 +161,30 @@ interface SteerInboxEntry {
   /** The follow-up row's id — the outcome's correlation key. */
   id: string;
   message: string;
+  /** The delivery-only frame (the "new message" marker), composed in
+   * front of the words at the harness boundary like a turn's context. */
+  context?: string;
+  /**
+   * The follow-up's own files: their manifest, and whether their parts
+   * (applied on the sync chain ahead of this entry) are on disk yet. The
+   * drain hands over only an entry whose files have landed, so it never
+   * waits on a file write; the landing itself drains again.
+   */
+  files?: {
+    manifest: AttachmentManifestEntry[];
+    landed: Promise<void>;
+    ready: boolean;
+  };
 }
+
+/**
+ * The model-facing text for a message: the delivery-only context the control
+ * plane framed it with, then the words. Composed HERE, at the harness
+ * boundary, for a turn and for a steer alike: the wire stays honest about
+ * message vs context, and the stored transcript never contains the frame.
+ */
+const composePrompt = (message: string, context: string | undefined): string =>
+  context ? `${context}\n\n${message}` : message;
 
 /**
  * Per-conversation ceiling on parked steer entries. The control plane caps
@@ -249,9 +289,12 @@ export const runSupervisor = async (
     applySync?: typeof applyHomeSync;
     processManager?: ProcessManager;
     memoryHarvester?: MemoryHarvester;
+    /** A capability the entrypoint added for this sandbox (addons.ts). */
+    addon?: SupervisorAddon;
   },
 ): Promise<void> => {
   const applySync = deps?.applySync ?? applyHomeSync;
+  const addon = deps?.addon;
   // MUTABLE on purpose (step 9): a home sync's final part carries fresh
   // instructions/agentName and re-renders from this same holder — a dashboard
   // brief edit reaches the docs mid-run.
@@ -278,6 +321,9 @@ export const runSupervisor = async (
     fragments: [
       connectionsFragment(harness.capabilities.skillsDir),
       cronsFragment,
+      // Unconditional like crons: webhooks are a hosted-agent platform
+      // property, and the tools answer "none yet" when there are none.
+      webhooksFragment,
       memoryFragment,
       // The channels section (where the agent can be talked to, and the
       // send_message/find_recipient teaching) is spliced in HERE by the
@@ -285,9 +331,16 @@ export const runSupervisor = async (
       // beside memory and ahead of the machine sections.
       processesFragment,
       // Unconditional like connections: what survives sleep/relaunch is a
-      // substrate property. Registered AFTER processes — its last bullet
-      // says "see Background processes above".
-      machineFragment,
+      // substrate property. The browsing bullet follows the desktop the
+      // supervisor brought up (index.ts exports DISPLAY before this runs).
+      machineFragment(process.env.DISPLAY ?? null),
+      // After machine: it extends "what is here" with "how a person sees
+      // it". Fragment and preview_expose arrive together, and only where
+      // the runner carries port streams.
+      ...(config.previews ? [previewsFragment] : []),
+      // A deployment's addon, after the machine sections it extends. Its
+      // fragments are fixed at boot, like its tools below.
+      ...(addon?.fragments ?? []),
       // Unconditional like connections: receiving files is a platform
       // property (every harness can read a file), not an adapter capability.
       attachmentsFragment,
@@ -361,6 +414,20 @@ export const runSupervisor = async (
     });
   registerSignalCleanup(() => processes.killAllSync("SIGTERM"));
 
+  // A wake a preview hit caused brings the apps behind the agent's shares
+  // back (the relaunch commands the agent registered with preview_expose),
+  // as ordinary background processes: the same spawn, caps, frames and
+  // keep-awake as a process_start. No watch is armed — a server has no
+  // "done" to report, and a platform-armed one would only add noise. The
+  // viewer meanwhile sits on the relay's auto-refreshing page.
+  for (const { port, command } of config.previewRelaunch ?? []) {
+    const started = processes.start({ command, name: `preview:${port}` }, null);
+    log(started.ok ? "info" : "warn", "preview app relaunch", {
+      port,
+      ...(started.error && { error: started.error }),
+    });
+  }
+
   const conversations = new Map<string, ConversationRuntime>();
 
   // The home-sync chain (step 9): its own serialized queue, separate
@@ -420,12 +487,49 @@ export const runSupervisor = async (
     send: (message) => transport.send(message),
   });
 
+  // Sandbox ports (plans/sandbox-ports.md §7): streams dialed from inside the
+  // guest on the runner's request, fenced by the pushed allowlist; discovery
+  // reports what is listening so the UI can offer a share.
+  const reservedPorts = reservedGuestPorts(process.env.OPEN_PROXY);
+  const portStreams = createPortStreams({
+    send: (message) => transport.send(message),
+    reservedPorts,
+  });
+  // What a deployment's addon (addons.ts) may do to this supervisor.
+  const addonHost: SupervisorAddonHost = {
+    // Every conversation with a live turn, never "the one": `activeTurn`
+    // answers null when two are in flight (its anchor rule).
+    steerLiveTurns: (id, message) => {
+      let steered = 0;
+      for (const runtime of conversations.values()) {
+        const turnId = runtime.activeTurnId;
+        if (!turnId) continue;
+        const steerId = id(turnId);
+        if (runtime.steerInbox.some((entry) => entry.id === steerId)) continue;
+        runtime.steerInbox.push({ targetTurnId: turnId, id: steerId, message });
+        void steerFromInbox(runtime);
+        steered += 1;
+      }
+      return steered;
+    },
+  };
+  const sendAddonReport = () =>
+    addon?.report?.((message) => transport.send(message));
+  const portDiscovery = startPortDiscovery({
+    send: (message) => transport.send(message),
+    // An addon's own listeners are the platform's (never offered as a
+    // share), like the open proxy: discovery must not list them.
+    reservedPorts: new Set([...reservedPorts, ...(addon?.reservedPorts ?? [])]),
+    onResend: sendAddonReport,
+  });
+
   const platformTools = await startPlatformTools({
     // Resolved per bridge startup (jcode spawns a bridge per session), so a
     // session started after a mid-run presence change advertises the tools
     // that change brought — the doc and the tools move together.
     tools: () => [
       ...cronsTools,
+      ...webhooksTools,
       ...memoryTools,
       // The messaging tools follow the channels section's condition: present
       // exactly when a LIVE presence exists — read from the SAME mutable
@@ -434,7 +538,12 @@ export const runSupervisor = async (
       ...channelsTools(renderInputs.channels),
       // message_agent follows the agents section's condition the same way.
       ...agentsTools(renderInputs.peers),
+      // list_apps is unconditional: grants change independently of this
+      // process, and the live tool is how a turn re-checks between syncs.
+      ...connectionsTools,
       ...createProcessTools(processes),
+      ...(config.previews ? previewsTools : []),
+      ...(addon?.tools ?? []),
       ...(config.outboundAttachments ? sendFile.tools : []),
       // The skills tools follow their fragment's condition exactly: no
       // skillsDir, no skills capability — teaching and tools arrive together.
@@ -546,6 +655,13 @@ export const runSupervisor = async (
    * removal after the await is by IDENTITY, because the entry's index can
    * shift (and the array itself be replaced by the turn-boundary prunes)
    * while the steer RPC is in flight.
+   *
+   * A follow-up WITH files goes only once they are on disk, with its
+   * inlineable images, packed like a turn's. Until then the drain stops at
+   * it (anything sent after it waits behind it, order kept) and returns:
+   * it never waits on a file write, so neither does a caller awaiting it
+   * (the reader, with an abort behind it; the run's first event). The
+   * files landing drains again.
    */
   const steerFromInbox = (runtime: ConversationRuntime): Promise<void> => {
     const drained = runtime.steerDrain.then(async () => {
@@ -563,9 +679,14 @@ export const runSupervisor = async (
         const entry = runtime.steerInbox.find(
           (candidate) => candidate.targetTurnId === turnId,
         );
-        if (!entry) return;
+        if (!entry || (entry.files && !entry.files.ready)) return;
+        const images = collectInlineImages(entry.files?.manifest);
         try {
-          await session.steer({ id: entry.id, message: entry.message });
+          await session.steer({
+            id: entry.id,
+            message: composePrompt(entry.message, entry.context),
+            ...(images.length > 0 && { images }),
+          });
         } catch (error) {
           log("info", "steer refused; leaving the follow-up to promotion", {
             turnId: entry.id,
@@ -732,7 +853,9 @@ export const runSupervisor = async (
      * error EVENT's code (the adapter mints them; the catch arm's raw throw
      * never does), and outrank the provider-refusal prose match. A rejected
      * transcript is checked before the refusal shapes too: its 400 must
-     * never read as a key problem (#1194).
+     * never read as a key problem (#1194). A model-endpoint 404 comes last:
+     * a 404 whose body also names a refusal (a quota page behind a proxy)
+     * keeps the more actionable key copy.
      */
     const classify = (raw: string | undefined): string | undefined =>
       failureCode(runtime) ??
@@ -745,47 +868,36 @@ export const runSupervisor = async (
             ? TURN_FAILURE_CODES.trialCreditExhausted
             : raw && isProviderRefusal(raw)
               ? TURN_FAILURE_CODES.modelProviderError
-              : undefined);
+              : raw && isModelEndpointNotFound(raw)
+                ? TURN_FAILURE_CODES.modelEndpointNotFound
+                : undefined);
 
     /**
-     * The CURRENT message segment — everything the agent has said since its
-     * last tool call or thinking block. NOT the whole turn.
-     *
-     * THE ANSWER IS THE LAST MESSAGE, NOT THE CONCATENATION OF ALL OF THEM
-     * (user decision, 2026-08-31). A working turn interleaves narration with
-     * tools — "Let me check the logs." → bash → "Now the config." → read →
-     * the actual finding — and gluing those together published the agent's
-     * running commentary AS its answer: the multi-screen chat walls that the
-     * response-style prompt could not fix, because every individual message
-     * was already short and compliant. The model was obeying the directive;
-     * this accumulator was undoing it downstream.
-     *
-     * Mid-turn segments are PROGRESS, not the record. They still stream —
-     * `text.delta` reaches every live tail and is ephemeral by the delta law
-     * (§3.17) — so both surfaces keep showing the work as it happens; only
-     * the closing message is what the transcript keeps and the channel posts.
+     * Which of the agent's words this turn keeps as its answer (answer.ts:
+     * what it said after its last tool call, message by message). Mid-turn
+     * narration still streams to every live tail; only the closing words are
+     * what the transcript keeps and the channel posts.
      */
-    let segment = "";
-    /**
-     * The last COMPLETED segment, kept solely as the never-silent fallback:
-     * a turn that ends on a tool call without a closing word (a stop, a
-     * crash, a failure mid-work) still said something, and posting nothing
-     * would read as the agent ignoring the person.
-     */
-    let previousSegment = "";
+    const answer = createAnswerTracker();
     let answerSent = false;
+    /** Store a follow-up's reply under its own row, bounded like the answer. */
+    const emitReply = (followUpId: string, reply: string) => {
+      transport.send({
+        kind: "event",
+        turnId: followUpId,
+        conversationId: item.conversationId,
+        event: { type: "text", text: reply.slice(0, MAX_ANSWER_CHARS) },
+      });
+    };
     /**
      * Send the answer exactly once, whatever ends the turn — cleanly, with an
      * error, by abort, or by the stream simply stopping. A partial answer is
      * still what the user watched arrive, so it is still what the transcript
      * owes them.
-     *
-     * The final segment wins; when the turn ended mid-tool with nothing said
-     * after it, the last completed segment stands in.
      */
     const emitAnswer = () => {
       if (answerSent) return;
-      const text = segment.trim() || previousSegment.trim();
+      const text = answer.answer();
       if (!text) return;
       answerSent = true;
       transport.send({
@@ -816,13 +928,16 @@ export const runSupervisor = async (
     // cleared first in the `finally`. Frames buffering while the channel is
     // down are fine: the outbound cap drops oldest, and delivery after a
     // reconnect just stamps late.
-    const progressTimer = setInterval(() => {
+    const beat = () =>
       transport.send({
         kind: "progress",
         turnId: item.turnId,
         conversationId: item.conversationId,
       });
-    }, config.progressIntervalMs ?? PROGRESS_INTERVAL_MS);
+    const progressTimer = setInterval(
+      beat,
+      config.progressIntervalMs ?? PROGRESS_INTERVAL_MS,
+    );
     progressTimer.unref();
 
     // Steer bookkeeping starts clean, and entries aimed at any OTHER turn are
@@ -870,20 +985,19 @@ export const runSupervisor = async (
       }
 
       // The delivery-only context (step 8: the memory index) is prepended
-      // HERE, at the harness boundary — the wire stays honest about message
-      // vs context, and the stored transcript never contains the frame.
-      // The EMPTY-PROMPT GUARD is load-bearing, not cosmetic: a file-only
-      // message on a path with no context (a runner without the attachments
-      // capability, a failed context build) would otherwise hand the harness
-      // an empty string, which jcode turns into an empty text block the
-      // model API rejects with a 400 (verified in v0.71.1; v0.81.1 still
-      // passes the content through verbatim, no filtering).
+      // HERE, at the harness boundary (`composePrompt`). The EMPTY-PROMPT
+      // GUARD is load-bearing, not cosmetic: a file-only message on a path
+      // with no context (a runner without the attachments capability, a
+      // failed context build) would otherwise hand the harness an empty
+      // string, which jcode turns into an empty text block the model API
+      // rejects with a 400 (verified in v0.71.1; v0.81.1 still passes the
+      // content through verbatim, no filtering).
       const surfaceNote = runtime.surfaceNote;
       runtime.surfaceNote = undefined;
       const context = [surfaceNote, item.context]
         .filter((part): part is string => Boolean(part))
         .join("\n\n");
-      const composed = context ? `${context}\n\n${item.message}` : item.message;
+      const composed = composePrompt(item.message, context);
       const prompt =
         composed.trim().length > 0
           ? composed
@@ -915,7 +1029,7 @@ export const runSupervisor = async (
         }
 
         // The adapter confirmed a steered follow-up was consumed by this
-        // run. Only ids this supervisor actually delivered are honored — an
+        // run. Only ids this supervisor actually delivered are honored: an
         // adapter cannot mint outcomes for messages it was never handed.
         if (
           event.type === "message.joined" &&
@@ -923,42 +1037,36 @@ export const runSupervisor = async (
         ) {
           runtime.steered.set(event.followUpId, true);
         }
-
-        // Accumulate the CURRENT segment. The deltas themselves are ephemeral
-        // by design (§3.17), and this supervisor is the only party that sees
-        // the whole stream — so if it does not keep the closing message,
-        // nothing can.
-        //
-        // BOUNDED, because this process runs inside a container executing
-        // model-driven output: a model that loops would otherwise grow this
-        // string until the sandbox is killed for memory. The cap sits well
-        // above the wire's own limit so the VISIBLE truncation stays the
-        // runner's job and a reader sees one marker, not two.
-        if (event.type === "text.delta" && segment.length < MAX_ANSWER_CHARS) {
-          segment += event.text;
+        // What the agent said back to a joined follow-up becomes that
+        // follow-up's OWN answer, stored under its row so the reply sits
+        // under the message it answers. Claimed out of the turn's answer
+        // first, so the words are kept once; the turn's closing words are
+        // never taken. The reply arrives LIVE, so a reply that is
+        // the answer's only words right now is held by the tracker and
+        // handed over below, at the first event showing the agent went on
+        // to say more. Honored under the same fence as the join. The
+        // platform's own steer (the ceiling warning) has no row to store it
+        // under: what the agent says back to it is the turn's wrap-up, and
+        // stays the turn's answer.
+        if (
+          event.type === "message.replied" &&
+          runtime.steered.get(event.followUpId) === true &&
+          !isPlatformSteerId(event.followUpId) &&
+          answer.claim(event.followUpId, event.reply)
+        ) {
+          emitReply(event.followUpId, event.reply);
         }
-        // A TOOL CALL closes the current segment: the model finished a
-        // message and starts a new one once the tool returns. What it says
-        // NEXT is the answer; this one is demoted to the never-silent
-        // fallback. Empty segments never displace a real one — back-to-back
-        // tool calls must not erase the last words said.
-        //
-        // TOOL CALLS ONLY, deliberately — thinking is NOT a boundary. A tool
-        // call is a structural break the model cannot write across: it must
-        // stop and wait for the result, so the next text is necessarily a new
-        // message. Reasoning is a parallel track that interleaves INSIDE one
-        // message ("The root cause is " → thinks → "the retry loop."), which
-        // the vendor protocol itself implies by giving reasoning its own
-        // start/stop (`reasoning_done`) beside the text stream. Treating it
-        // as a boundary would cut that sentence in half and publish the
-        // fragment — strictly worse than the wall it replaced, because it is
-        // silently wrong rather than merely long. It also buys nothing:
-        // `thinking.delta` is never persisted (turn-service DURABILITY) and
-        // the web does not render it, so reasoning is already discarded
-        // everywhere downstream.
+
+        // The answer is built from the harness's own events, framing
+        // included. The deltas themselves are ephemeral by design (the
+        // delta law), and this supervisor is the only party that sees the
+        // whole stream, so if it does not keep the closing words, nothing
+        // can.
+        for (const handed of answer.observe(event)) {
+          emitReply(handed.followUpId, handed.reply);
+        }
+
         if (event.type === "tool.started" || event.type === "tool.finished") {
-          if (segment.trim()) previousSegment = segment;
-          segment = "";
           const bare = bareToolName(event.name);
           const open = runtime.openTools.get(bare) ?? 0;
           if (event.type === "tool.started") {
@@ -975,12 +1083,36 @@ export const runSupervisor = async (
         // reply below the marker that says the turn ended.
         if (isTerminalEvent(event)) emitAnswer();
 
-        transport.send({
-          kind: "event",
-          turnId: item.turnId,
-          conversationId: item.conversationId,
-          event,
-        });
+        // Framing stops here (answer.ts): a correction has no wire form, and
+        // a delta travels without its message id. A delta that is the reply
+        // to a steered follow-up travels under THAT follow-up's id, so the
+        // reply streams under the message it answers (the durable `text`
+        // the handover stores there replaces it). Under the same fence as
+        // the join: only a follow-up this supervisor delivered and saw
+        // joined re-keys a delta (an adapter cannot stream under a row it
+        // was never handed). The platform's own steer has no row, so its
+        // reply stays under the turn.
+        const wire = toWireEvent(event);
+        if (wire) {
+          const replyTarget = replyTargetOf(event);
+          transport.send({
+            kind: "event",
+            turnId:
+              replyTarget !== undefined &&
+              runtime.steered.get(replyTarget) === true
+                ? replyTarget
+                : item.turnId,
+            conversationId: item.conversationId,
+            event: wire,
+          });
+        }
+        // The FIRST beat goes out right behind `turn.started`, not an
+        // interval later: the stall sweep only covers a turn that has beaten
+        // at least once, so a turn shorter than one interval whose
+        // `turn.finished` was then lost waited out the whole turn ceiling.
+        // Behind it, never before it: the control plane stamps only a
+        // RUNNING turn, and `turn.started` is what makes it running.
+        if (event.type === "turn.started") beat();
         if (event.type === "turn.done") {
           sawCleanEnd = true;
           usage = event.usage;
@@ -1015,21 +1147,11 @@ export const runSupervisor = async (
         conversationId: item.conversationId,
         status,
         ...(errorCode && { errorCode }),
-        // The raw refusal rides beside the code — the control plane stores
-        // only the canonical copy and keeps this for its server log (and an
-        // old control plane's raw passthrough matches the catch arm below).
-        // `harness_busy` / `harness_no_terminal` / `transcript_rejected`
-        // attach it too, as the version-skew guard: an old control plane
-        // that ignores the code then stores visible text instead of
-        // regressing to the silent NULL shape. Uncoded failures keep
-        // today's shape: no error field, the transcript stream's own error
-        // event is the witness. Sliced at the source per the transport's
-        // truncate-at-sender law: this frame must deliver.
-        ...((errorCode === TURN_FAILURE_CODES.modelProviderError ||
-          errorCode === TURN_FAILURE_CODES.trialCreditExhausted ||
-          errorCode === TURN_FAILURE_CODES.harnessBusy ||
-          errorCode === TURN_FAILURE_CODES.harnessNoTerminal ||
-          errorCode === TURN_FAILURE_CODES.transcriptRejected) &&
+        // Preserve terminal errors on coded and uncoded failures alike.
+        // Known codes map to canonical copy in the control plane. Uncoded
+        // failures keep this raw detail instead of closing with a NULL error.
+        // Bound at the sender: an oversized terminal frame would be dropped.
+        ...(status === "failed" &&
           terminalError && {
             error: terminalError.slice(0, MAX_TURN_RESULT_ERROR_CHARS),
           }),
@@ -1181,6 +1303,79 @@ export const runSupervisor = async (
   };
 
   /**
+   * SEND NOW: the person asked the run to read a waiting
+   * follow-up NOW rather than after the tool it is waiting on. Moves that
+   * tool to the background (it keeps running; the model is told where to
+   * collect it), so the run reaches its next safe point and the queued
+   * message is injected within moments.
+   *
+   * The answer goes back under the FOLLOW-UP's own id as
+   * `message.sent_now`, and it is only ever what happened:
+   *
+   * - the run ended, or this is not its run: silence. Nothing is waiting
+   *   any more; the row's own status tells the rest.
+   * - the message was already read (joined): silence, for the same reason.
+   * - the message never reached this run (a refused steer, an inbox that
+   *   was full): `moved: false`, so the person is not left waiting on a
+   *   request nothing can serve. It is read at the next safe point, or runs
+   *   as the next turn.
+   * - delivered and waiting: the harness moves the tool, and says whether
+   *   it did.
+   *
+   * A steer delivery still in flight is awaited first: the control plane
+   * may hand over the delivery and this request in one batch, and the
+   * request must see the delivery's outcome rather than race it.
+   */
+  const sendNow = async (item: {
+    turnId: string;
+    targetTurnId: string;
+    conversationId: string;
+  }) => {
+    const runtime = conversations.get(item.conversationId);
+    if (runtime) {
+      // The steer it asks about may still be waiting on its files; its
+      // landing drains, and this waits for that drain (registered first).
+      await runtime.steerInbox.find((entry) => entry.id === item.turnId)?.files
+        ?.landed;
+      await runtime.steerDrain;
+    }
+    if (
+      !runtime ||
+      runtime.activeTurnId !== item.targetTurnId ||
+      runtime.steered.get(item.turnId) === true
+    ) {
+      log("info", "send now for a message nothing is waiting on", {
+        conversationId: item.conversationId,
+        turnId: item.turnId,
+      });
+      return;
+    }
+    const session = runtime.session;
+    const moved: BackgroundedTool =
+      runtime.steered.has(item.turnId) &&
+      runtime.streamStarted &&
+      harness.capabilities.backgroundTool &&
+      session?.backgroundRunningTool
+        ? await session.backgroundRunningTool()
+        : { moved: false };
+    log("info", "send now", {
+      conversationId: item.conversationId,
+      turnId: item.turnId,
+      moved: moved.moved,
+    });
+    transport.send({
+      kind: "event",
+      turnId: item.turnId,
+      conversationId: item.conversationId,
+      event: {
+        type: "message.sent_now",
+        moved: moved.moved,
+        ...(moved.moved && moved.toolName && { toolName: moved.toolName }),
+      },
+    });
+  };
+
+  /**
    * A HARNESS THAT DIED TAKES THE SANDBOX WITH IT.
    *
    * Once the runtime behind the adapter is gone, nothing in this container can
@@ -1218,6 +1413,9 @@ export const runSupervisor = async (
   });
 
   transport.send({ kind: "ready", harness: harness.id });
+  // An addon's report, once at ready (then on the re-send beat), so the
+  // control plane hears it before anything reads it.
+  sendAddonReport();
 
   try {
     // An explicit iterator, not `for await`, so the read can be raced against
@@ -1245,6 +1443,22 @@ export const runSupervisor = async (
       }
       if (next.done) break;
       const item = next.value;
+
+      if (isPortWorkItem(item)) {
+        // Sandbox ports (plans/sandbox-ports.md §7): byte streams must never
+        // queue behind a running turn (a preview would hang for its whole
+        // duration), and the handler never awaits — it is a socket pump.
+        portStreams.handle(item);
+        continue;
+      }
+
+      if (item.kind === "desktop.control") {
+        // Inline like the port pump and the steer: queued behind a running
+        // turn it would land after that turn ended. The addon that knows
+        // the kind handles it; without one the frame is inert.
+        addon?.handle?.(item, addonHost);
+        continue;
+      }
 
       if (item.kind === "shutdown") {
         log("info", "shutdown requested");
@@ -1274,16 +1488,42 @@ export const runSupervisor = async (
           });
           continue;
         }
-        runtime.steerInbox.push({
+        const entry: SteerInboxEntry = {
           targetTurnId: item.targetTurnId,
           id: item.turnId,
           message: item.message,
-        });
+          ...(item.context && { context: item.context }),
+        };
+        if (item.attachments?.length) {
+          // Its parts came ahead of this frame and are on the sync chain
+          // right now: it lands with them, and the landing drains again.
+          const files: NonNullable<SteerInboxEntry["files"]> = {
+            manifest: item.attachments,
+            ready: false,
+            landed: syncQueue.then(() => {
+              files.ready = true;
+            }),
+          };
+          entry.files = files;
+          void files.landed.then(() => steerFromInbox(runtime));
+        }
+        runtime.steerInbox.push(entry);
         if (runtime.activeTurnId === item.targetTurnId) {
           await steerFromInbox(runtime).catch((error: unknown) =>
             log("warn", "steer failed", { error: String(error) }),
           );
         }
+        continue;
+      }
+
+      if (item.kind === "turn.send_now") {
+        // Inline like abort and steer: queued behind the turn it should
+        // interrupt, it would arrive after the tool it means to cut short.
+        // Not awaited: it waits for the steer it asks about to be handed
+        // over, files included, and the reader must stay free for an abort.
+        void sendNow(item).catch((error: unknown) =>
+          log("warn", "send now failed", { error: String(error) }),
+        );
         continue;
       }
 
@@ -1351,6 +1591,7 @@ export const runSupervisor = async (
             const beforePresences = [...renderInputs.channels];
             const beforePeers = peersKey(renderInputs.peers);
             const beforeConnections = connectionsKey(renderInputs.connections);
+            const beforeConnectionList = [...renderInputs.connections];
             await applySync(
               config.homeDir,
               item,
@@ -1373,7 +1614,16 @@ export const runSupervisor = async (
             ) {
               // A live session read the old connected-apps list (or an old
               // bound host) — restart it so it calls the right place.
-              markSessionsStale("connections changed", null);
+              // The note is the transcript half: a restarted session still
+              // reads its own earlier "X isn't connected" turns, and a
+              // re-rendered doc loses to them (the Granola incident).
+              markSessionsStale(
+                "connections changed",
+                connectionsChangeNote(
+                  beforeConnectionList,
+                  renderInputs.connections,
+                ),
+              );
             }
           })
           .catch((error: unknown) => {
@@ -1395,7 +1645,8 @@ export const runSupervisor = async (
       // running turns for the life of the container.
       // Everything above `continue`s, so the only shape that reaches here is
       // turn.deliver. Asserting it keeps a future work-item arm from
-      // compiling into this branch and being run as a turn.
+      // compiling into this branch and being run as a turn. (The transport
+      // type already excludes the WS driver's own `session`/`ack` items.)
       if (item.kind !== "turn.deliver") {
         const unreachable: never = item;
         log("warn", "unhandled work item", {
@@ -1443,6 +1694,10 @@ export const runSupervisor = async (
     harvester.stop();
     // Pending send_file waits resolve as timeouts for the same reason.
     sendFile.close();
+    // Preview streams and discovery: abort every open stream (the runner
+    // tears its halves down on the channel close anyway) and stop polling.
+    portDiscovery.stop();
+    portStreams.close();
     // Background children next: SIGTERM their groups and destroy their pipes
     // (open pipe handles would otherwise hold this process past the loop's
     // end). Sends nothing — once the container stops the control plane's

@@ -1,9 +1,14 @@
 import { db, Prisma } from "@onecli/db";
-import { runnerCapabilitiesSchema } from "@onecli/agent-protocol";
+import {
+  ceilingWarningSteerId,
+  runnerCapabilitiesSchema,
+} from "@onecli/agent-protocol";
 import {
   MAX_HELD_AWAKE_SANDBOXES,
+  SANDBOX_BACKGROUND_CAP_SECONDS,
   SANDBOX_IDLE_STOP_SECONDS,
   SSH_SESSION_LEASE_SECONDS,
+  STALE_DISPATCH_SECONDS,
   TURN_CEILING_SECONDS,
   TURN_CEILING_WARNING_SECONDS,
   TURN_STALL_SECONDS,
@@ -13,11 +18,22 @@ import {
   AGENT_NEVER_STARTED_MESSAGE,
   AUTOMATION_SOURCES,
   FOLLOW_UP_EXPIRED_MESSAGE,
+  STEERED_FOLLOW_UP_CONTEXT,
   TURN_CEILING_WARNING_MESSAGE,
   TURN_STALLED_MESSAGE,
   TURN_TIME_LIMIT_MESSAGE,
+  isAutomationSource,
 } from "../validations/conversation";
 import { logger } from "../lib/logger";
+import {
+  channelHeldBy,
+  lifecycleFreeFor,
+  takeOwnership,
+} from "./runner-replica-fence";
+import {
+  getAgentDesktop,
+  type AgentDesktopPush,
+} from "../providers/hooks/agent-desktop";
 
 const log = logger.child({ component: "due-work" });
 
@@ -62,29 +78,90 @@ const liveSshSessionExists = () => Prisma.sql`EXISTS (
  * dashboard signal joins on it (so a live SSH session lights the dashboard's
  * "working in the background" badge too — accepted: one definition beats a
  * split predicate, and a held-open box IS busy from a capacity standpoint).
- * Three live shapes hold a box up: a lease-current SSH session, plus a running
- * process whose container_ref matches the sandbox's CURRENT one (a running
- * row from a DEAD container must never keep a fresh box awake — the lost
- * sweep terminalizes it), and a watch that is armed (detection lives in
- * supervisor memory) or triggered (its fire is owed). `s` must be the
+ *
+ * ENGAGEMENT, not existence (idle servers and forgotten `bg` tasks once held
+ * boxes for days). Three live shapes hold a box up, and all three are
+ * bounded by the background cap:
+ *
+ * - a running process on the sandbox's CURRENT container that is BUSY —
+ *   wrote output inside the idle window, or was using CPU at its last
+ *   report (a running row from a DEAD container must never keep a fresh box
+ *   awake — the lost sweep terminalizes it; a row from a supervisor that
+ *   predates the busy fields carries neither and reads idle, the fail-safe
+ *   direction);
+ * - a watch the AGENT armed (`origin = 'agent'`: the process_watch tool,
+ *   or its harness's own "wake me" mirrored) that is armed or triggered
+ *   (its fire is owed). The platform's own watch (the turn-end safety net
+ *   nobody asked for) only REPORTS: it is excluded here, or every
+ *   forgotten task would hold its box for the watch's 24h expiry;
+ * - a lease-current SSH session.
+ *
+ * The CAP wraps the first two: background work alone holds a box for at
+ * most `SANDBOX_BACKGROUND_CAP_SECONDS` after the last engagement by a
+ * person or a turn (`last_engaged_at`; null = never engaged = no hold).
+ * An SSH session IS a person, so it sits outside the cap. `s` must be the
  * enclosing query's sandboxes alias.
  *
  * A function, not a module-level const, so unit lanes with a mocked
  * `@onecli/db` (whose `Prisma` carries no `sql`) can import this module
  * without ever touching the real tagged-template helper.
  */
-const keepAwakeExists = () => Prisma.sql`(EXISTS (
-  SELECT 1 FROM sandbox_processes p
-  WHERE p.sandbox_id = s.id
-    AND (
-      (p.status = 'running' AND p.container_ref = s.container_ref)
-      OR EXISTS (
-        SELECT 1 FROM process_watches w
-        WHERE w.process_id = p.id
-          AND w.status IN ('armed', 'triggered')
-      )
+const keepAwakeExists = (idleBefore: Date, capBefore: Date) => Prisma.sql`(
+  (
+    -- IS NOT NULL first: a never-engaged box must read FALSE here, not
+    -- NULL, because the stop arm NEGATES this whole fragment and
+    -- NOT NULL is NULL, which would hold that box up forever.
+    s.last_engaged_at IS NOT NULL
+    AND s.last_engaged_at > ${capBefore}
+    AND EXISTS (
+      SELECT 1 FROM sandbox_processes p
+      WHERE p.sandbox_id = s.id
+        AND (
+          (
+            p.status = 'running'
+            AND p.container_ref = s.container_ref
+            AND (p.last_output_at > ${idleBefore} OR p.cpu_busy)
+          )
+          OR EXISTS (
+            SELECT 1 FROM process_watches w
+            WHERE w.process_id = p.id
+              AND w.origin = 'agent'
+              AND w.status IN ('armed', 'triggered')
+          )
+        )
     )
-) OR ${liveSshSessionExists()})`;
+  )
+  OR ${liveSshSessionExists()}
+)`;
+
+/** The two clocks every keep-awake read needs, computed once per call. */
+const keepAwakeClocks = () => ({
+  idleBefore: new Date(Date.now() - SANDBOX_IDLE_STOP_SECONDS * 1000),
+  capBefore: new Date(Date.now() - SANDBOX_BACKGROUND_CAP_SECONDS * 1000),
+});
+
+/**
+ * ENGAGEMENT: a person or a turn touched this sandbox — the one write that
+ * restarts BOTH clocks keep-awake reads (`last_active_at`, the idle window;
+ * `last_engaged_at`, the background cap). Every site that means "somebody
+ * wants this box right now" calls this and nothing else: a turn's events
+ * and heartbeat, a person's preview, desktop or SSH use. Boot and ready
+ * reports deliberately stamp only `last_active_at` on their own, so the
+ * cap keeps measuring from the last ENGAGEMENT, not the last container.
+ *
+ * Running sandboxes only, by the caller's `where`: a stamp must never
+ * resurrect a parked box (waking is `wakeSandboxFor`'s explicit job).
+ */
+export const markSandboxEngaged = async (
+  tx: Pick<typeof db, "sandbox">,
+  where: { id: string } | { agentId: string },
+): Promise<void> => {
+  const at = new Date();
+  await tx.sandbox.updateMany({
+    where: { ...where, status: "running" },
+    data: { lastActiveAt: at, lastEngagedAt: at },
+  });
+};
 
 /**
  * The per-runner held-awake ceiling (step 13, the release-blocker bound):
@@ -94,26 +171,21 @@ const keepAwakeExists = () => Prisma.sql`(EXISTS (
  * that operator chose a single slot, and disabling keep-awake entirely there
  * would be the worse default.
  */
-export const heldAwakeCeilingFor = (capabilities: unknown): number => {
-  if (MAX_HELD_AWAKE_SANDBOXES !== null) return MAX_HELD_AWAKE_SANDBOXES;
+export const heldAwakeCeiling = (
+  capabilities: unknown,
+  override: number | null,
+): number => {
+  if (override !== null) return override;
   const parsed = runnerCapabilitiesSchema.safeParse(capabilities);
   const maxSandboxes = parsed.success ? parsed.data.maxSandboxes : 0;
   return Math.max(1, maxSandboxes - 1);
 };
 
-/**
- * How long a turn may sit `dispatched` before it is handed out again.
- *
- * Much shorter than the sandbox claim window, because `dispatched` is a
- * narrow state: the runner writes the turn to a live socket and the harness
- * emits `turn.started` at once, which moves it to `running`. Still sitting
- * here a minute later means it went into a socket that died on the way — a
- * real race while a sandbox is reconnecting — and the turn is simply lost
- * until someone re-dispatches it. Sharing the 5-minute sandbox window made
- * that a five-minute silence for the user; a `running` turn is unaffected,
- * so a slow model is never interrupted by this.
- */
-const STALE_DISPATCH_SECONDS = 90;
+export const heldAwakeCeilingFor = (capabilities: unknown): number =>
+  heldAwakeCeiling(capabilities, MAX_HELD_AWAKE_SANDBOXES);
+
+// `STALE_DISPATCH_SECONDS` (how long a turn may sit `dispatched` before it is
+// handed out again) lives in `lib/env`, tunable like the other windows here.
 
 /**
  * How long a sandbox that FAILED to start waits before it is tried again.
@@ -199,6 +271,20 @@ export interface DueTurnMessage {
   conversationId: string;
   sandboxId: string;
   message: string;
+  /**
+   * Delivery-only frame the supervisor prepends at the harness boundary
+   * (`STEERED_FOLLOW_UP_CONTEXT`): set for a follow-up someone sent (a
+   * person, a peer agent), absent for an automation's and for the platform's
+   * own ceiling warning, whose messages carry their own header.
+   */
+  context?: string;
+  /**
+   * The follow-up carries files: the dispatch composes their manifest and
+   * note (`planTurnAttachments`, the turn's own composer) only then, so a
+   * text-only steer costs no extra read. Claimed only for a runner that
+   * advertised `steerAttachments`.
+   */
+  hasAttachments: boolean;
 }
 
 /** A RUNNING sandbox whose home projection is behind desired (step 9). */
@@ -210,13 +296,27 @@ export interface DueHomeSync {
   generation: number;
 }
 
+/** SEND NOW: a delivered follow-up the person asked the run
+ * to read now. */
+export interface DueTurnSendNow {
+  kind: "turn.send_now";
+  /** The waiting follow-up row's own id. */
+  turnId: string;
+  /** The running turn it was delivered into. */
+  targetTurnId: string;
+  conversationId: string;
+  sandboxId: string;
+}
+
 export type DueWork =
   | DueStart
   | DueStop
   | DueTurn
   | DueTurnAbort
   | DueTurnMessage
-  | DueHomeSync;
+  | DueTurnSendNow
+  | DueHomeSync
+  | AgentDesktopPush;
 
 interface ClaimedRow {
   id: string;
@@ -270,12 +370,23 @@ interface SteerRow {
   /** From a correlated subquery — typed honestly, filtered at the mapping. */
   sandbox_id: string | null;
   message: string;
+  /** Who wrote it: a sender's follow-up is framed, an automation's is not. */
+  source: string;
+  has_attachments: boolean;
 }
 
 interface SyncRow {
   id: string;
   agent_id: string;
   home_desired_generation: number;
+}
+
+interface SendNowRow {
+  id: string;
+  conversation_id: string;
+  follow_up_of_turn_id: string;
+  /** From a correlated subquery, typed honestly, filtered at the mapping. */
+  sandbox_id: string | null;
 }
 
 /**
@@ -313,16 +424,21 @@ export const HOME_SYNC_RETRY_SECONDS = 60;
  *
  * Both arms are fenced by `runner_id`: a sandbox lives on the runner that
  * created it, so runner B can never claim runner A's work (§3.17 — moot with
- * one runner, load-bearing the moment a second appears).
+ * one runner, load-bearing the moment a second appears). Lifecycle arms
+ * (start, stop, evict) are claimed by the sandbox's owning copy, or any copy
+ * when it has none or its owner died (`lifecycleFreeFor`); the arms that
+ * need the sandbox's socket are claimed only by the copy holding it
+ * (`channelHeldBy`). Both apply only when the caller names its copy.
  */
 export const claimDueWork = async (
   runnerId: string,
   limit: number,
+  replicaId?: string,
 ): Promise<DueWork[]> => {
   const staleBefore = new Date(Date.now() - STALE_CLAIM_SECONDS * 1000);
   const staleDispatch = new Date(Date.now() - STALE_DISPATCH_SECONDS * 1000);
   const retryBefore = new Date(Date.now() - START_RETRY_SECONDS * 1000);
-  const idleBefore = new Date(Date.now() - SANDBOX_IDLE_STOP_SECONDS * 1000);
+  const { idleBefore, capBefore } = keepAwakeClocks();
   const syncRetryBefore = new Date(Date.now() - HOME_SYNC_RETRY_SECONDS * 1000);
   const priorityAgeBefore = new Date(
     Date.now() - WAKE_PRIORITY_AGE_SECONDS * 1000,
@@ -340,6 +456,7 @@ export const claimDueWork = async (
       WITH claimed AS (
         SELECT s.id FROM sandboxes s
         WHERE s.runner_id = ${runnerId}
+          ${lifecycleFreeFor(replicaId)}
           AND (
             s.status = 'unprovisioned'
             OR (s.status IN ('starting', 'stopping') AND s.updated_at < ${staleBefore})
@@ -423,7 +540,22 @@ export const claimDueWork = async (
         -- claim is the one atomic gate every start path crosses; compose can
         -- fail/release after it, and a later re-claim re-resets — idempotent.
         home_applied_generation = 0,
-        home_sync_claimed_at = NULL
+        home_sync_claimed_at = NULL,
+        -- A fresh boot is what a restart was waiting for (see the stop arm).
+        stop_requested_at = NULL,
+        -- The last stop's verdict is spent once a new boot begins; the lost
+        -- sweep must read a NEW death as lost, never as the old park. The
+        -- wake reason is NOT cleared here: the start payload is composed
+        -- after this claim and reads it; the ready report clears it.
+        stop_reason = NULL,
+        -- A start replaces the container, so whatever channel the old one
+        -- had is history: the new spawn records its own, and channel-bound
+        -- work waits for its supervisor to connect.
+        channel_replica_id = NULL,
+        channel_connection_id = NULL,
+        channel_token_hash = NULL,
+        channel_since = NULL
+        ${takeOwnership(replicaId)}
       FROM claimed c
       WHERE s.id = c.id
       RETURNING s.id, s.agent_id, s.container_ref
@@ -436,27 +568,51 @@ export const claimDueWork = async (
             WITH claimed AS (
               SELECT s.id FROM sandboxes s
               WHERE s.runner_id = ${runnerId}
+                ${lifecycleFreeFor(replicaId)}
                 AND s.status = 'running'
-                AND s.last_active_at IS NOT NULL
-                AND s.last_active_at < ${idleBefore}
-                -- Never park a sandbox with work in flight. The idle column
-                -- alone is not enough: a model that thinks in silence for
-                -- longer than the idle window would have its container pulled
-                -- out from under it mid-answer.
-                AND NOT EXISTS (
-                  SELECT 1 FROM conversations c
-                  JOIN turns t ON t.conversation_id = c.id
-                  WHERE c.agent_id = s.agent_id
-                    AND t.status IN ('queued', 'dispatched', 'running')
+                AND (
+                  -- A RESTART: a person asked for this box to go, so it
+                  -- goes now, ahead of the idle window, keep-awake, and
+                  -- whatever it is doing (the restart already failed the
+                  -- turns it was running; a turn that raced onto it ends
+                  -- with it through the ordinary strand door). The flag
+                  -- stays set through the stop and is cleared by the next
+                  -- start claim, so nothing is dispatched to this boot and
+                  -- no session ref it reports is kept in the meantime.
+                  s.stop_requested_at IS NOT NULL
+                  OR (
+                    s.last_active_at IS NOT NULL
+                    AND s.last_active_at < ${idleBefore}
+                    -- Never park a sandbox with work in flight. The idle
+                    -- column alone is not enough: a model that thinks in
+                    -- silence for longer than the idle window would have
+                    -- its container pulled out from under it mid-answer.
+                    AND NOT EXISTS (
+                      SELECT 1 FROM conversations c
+                      JOIN turns t ON t.conversation_id = c.id
+                      WHERE c.agent_id = s.agent_id
+                        AND t.status IN ('queued', 'dispatched', 'running')
+                    )
+                    -- §3.9 keep-awake: live background work holds the box up
+                    -- (keepAwakeExists above — one definition, negated here).
+                    AND NOT ${keepAwakeExists(idleBefore, capBefore)}
+                  )
                 )
-                -- §3.9 keep-awake: live background work holds the box up
-                -- (keepAwakeExists above — one definition, negated here).
-                AND NOT ${keepAwakeExists()}
-              ORDER BY s.last_active_at ASC
+              -- Someone is waiting on a restart; nobody is waiting on a park.
+              ORDER BY (s.stop_requested_at IS NULL), s.last_active_at ASC
               LIMIT ${remaining}
               FOR UPDATE OF s SKIP LOCKED
             )
-            UPDATE sandboxes s SET status = 'stopping', updated_at = now()
+            UPDATE sandboxes s SET status = 'stopping', updated_at = now(),
+              -- WHY the box goes down, for the lost sweep's verdict and the
+              -- ledger's tag. Every stop the control plane CLAIMS ends the
+              -- box's processes 'parked' (a quiet notice, never a wake):
+              -- the restart is the person's own doing, and the cap case is
+              -- a park too, so 'idle' covers both (the agent's remedy is
+              -- the same: start the work again when it is wanted).
+              stop_reason = CASE WHEN s.stop_requested_at IS NOT NULL
+                THEN 'restart' ELSE 'idle' END
+              ${takeOwnership(replicaId)}
             FROM claimed c
             WHERE s.id = c.id
             RETURNING s.id, s.agent_id, s.container_ref
@@ -489,7 +645,7 @@ export const claimDueWork = async (
         SELECT count(*)::int AS held FROM sandboxes s
         WHERE s.runner_id = ${runnerId}
           AND s.status = 'running'
-          AND ${keepAwakeExists()}
+          AND ${keepAwakeExists(idleBefore, capBefore)}
       `;
       const excess = (counted?.held ?? 0) - ceiling;
       if (excess > 0) {
@@ -497,6 +653,7 @@ export const claimDueWork = async (
           WITH claimed AS (
             SELECT s.id FROM sandboxes s
             WHERE s.runner_id = ${runnerId}
+              ${lifecycleFreeFor(replicaId)}
               AND s.status = 'running'
               AND s.last_active_at IS NOT NULL
               AND s.last_active_at < ${idleBefore}
@@ -506,12 +663,14 @@ export const claimDueWork = async (
                 WHERE c.agent_id = s.agent_id
                   AND t.status IN ('queued', 'dispatched', 'running')
               )
-              AND ${keepAwakeExists()}
+              AND ${keepAwakeExists(idleBefore, capBefore)}
             ORDER BY s.last_active_at ASC
             LIMIT ${Math.min(excess, remainingAfterStops)}
             FOR UPDATE OF s SKIP LOCKED
           )
-          UPDATE sandboxes s SET status = 'stopping', updated_at = now()
+          UPDATE sandboxes s SET status = 'stopping', updated_at = now(),
+            stop_reason = 'evict'
+            ${takeOwnership(replicaId)}
           FROM claimed c
           WHERE s.id = c.id
           RETURNING s.id, s.agent_id, s.container_ref
@@ -556,6 +715,7 @@ export const claimDueWork = async (
         JOIN conversations c ON c.id = t.conversation_id
         JOIN sandboxes s ON s.agent_id = c.agent_id
         WHERE s.runner_id = ${runnerId}
+          ${channelHeldBy(replicaId)}
           AND t.abort_requested = true
           AND t.status IN ('dispatched', 'running', 'failed')
         ORDER BY t.created_at ASC
@@ -592,15 +752,16 @@ export const claimDueWork = async (
     //   all-or-nothing, so an unknown work kind would poison whole claimed
     //   batches on an older runner. A runner that never advertised
     //   `steerMessages` simply never receives one; its follow-ups promote.
-    // - The ATTACHMENT carve-out — a follow-up carrying attachments is NEVER
-    //   steered (decided at planning, with the user): the harness's live
-    //   injection surface is text-only at our integration layer, so the
-    //   files could not ride along. It parks and promotes at the target's
-    //   close, running as its own turn with full delivery + inline vision.
-    //   Race-free by construction: the bind commits in the follow-up's own
-    //   create transaction, so this predicate can never observe the row
-    //   before its attachments. The FIFO guard below then also parks LATER
-    //   text follow-ups behind it — order preserved, accepted cost.
+    // - The ATTACHMENT gate: a follow-up carrying attachments steers WITH
+    //   them (the runner pulls the bytes ahead of the frame, the supervisor
+    //   hands the images to the harness with the words), so it rides only a
+    //   runner that advertised `steerAttachments`. Through an older runner it
+    //   parks and promotes at the target's close instead, running as its own
+    //   turn with full delivery: an older runner would forward the words and
+    //   drop the files. Race-free by construction: the bind commits in the
+    //   follow-up's own create transaction, so this predicate can never
+    //   observe the row before its attachments. The FIFO guard below then
+    //   also parks LATER follow-ups behind a parked one: order preserved.
     //
     // The target must already be handed over (`dispatched`/`running`): a
     // steer for a still-queued turn waits here — the supervisor could not
@@ -614,14 +775,18 @@ export const claimDueWork = async (
         JOIN sandboxes s ON s.agent_id = c.agent_id
         JOIN runners r ON r.id = s.runner_id
         WHERE s.runner_id = ${runnerId}
+          ${channelHeldBy(replicaId)}
           AND s.status = 'running'
           AND f.status = 'joining'
           AND f.steer_delivered_at IS NULL
           AND target.status IN ('dispatched', 'running')
           AND (r.capabilities->>'steerMessages')::boolean IS TRUE
-          AND NOT EXISTS (
-            SELECT 1 FROM conversation_attachments att
-            WHERE att.turn_id = f.id
+          AND (
+            (r.capabilities->>'steerAttachments')::boolean IS TRUE
+            OR NOT EXISTS (
+              SELECT 1 FROM conversation_attachments att
+              WHERE att.turn_id = f.id
+            )
           )
           AND NOT EXISTS (
             SELECT 1 FROM turns older
@@ -647,7 +812,12 @@ export const claimDueWork = async (
         (SELECT s.id FROM conversations c
            JOIN sandboxes s ON s.agent_id = c.agent_id
           WHERE c.id = f.conversation_id) AS sandbox_id,
-        f.message
+        f.message,
+        f.source,
+        EXISTS (
+          SELECT 1 FROM conversation_attachments att
+          WHERE att.turn_id = f.id
+        ) AS has_attachments
     `;
 
     // Home syncs (step 9), BEFORE turns on purpose: the composed items
@@ -659,6 +829,7 @@ export const claimDueWork = async (
       WITH claimed AS (
         SELECT s.id FROM sandboxes s
         WHERE s.runner_id = ${runnerId}
+          ${channelHeldBy(replicaId)}
           AND s.status = 'running'
           AND s.home_applied_generation < s.home_desired_generation
           AND (s.home_sync_claimed_at IS NULL
@@ -672,6 +843,14 @@ export const claimDueWork = async (
       WHERE s.id = c.id
       RETURNING s.id, s.agent_id, s.home_desired_generation
     `;
+
+    // A hosted-platform capability's pushes, right after syncs and before
+    // turns for the same reason: a person's change lands before the next
+    // turn's frames. Absent (self-host): nothing to claim.
+    const agentDesktop = getAgentDesktop();
+    const desktopPushes = agentDesktop
+      ? await agentDesktop.claimPushes(tx, runnerId, replicaId)
+      : [];
 
     // THE APPROACHING-CEILING WARNING. A running turn inside the warning
     // window gets one steer telling the agent to wrap up: report the status
@@ -700,6 +879,7 @@ export const claimDueWork = async (
         JOIN sandboxes s ON s.agent_id = c.agent_id
         JOIN runners r ON r.id = s.runner_id
         WHERE s.runner_id = ${runnerId}
+          ${channelHeldBy(replicaId)}
           AND s.status = 'running'
           AND t.status = 'running'
           AND t.ceiling_warned_at IS NULL
@@ -723,6 +903,9 @@ export const claimDueWork = async (
     // Turns whose sandbox is actually up. A queued turn on a sleeping sandbox
     // waits here until the start arm has woken it and the supervisor reported
     // ready — which is why `createTurn` flips a stopped sandbox itself.
+    // A box awaiting its restart is not "up" for new work: its harness still
+    // holds the sessions the restart discarded, so the turn waits for the
+    // fresh boot (the start arm's EXISTS wakes it once the stop lands).
     const turns = await tx.$queryRaw<ClaimedTurnRow[]>`
       WITH claimed AS (
         SELECT t.id
@@ -730,7 +913,9 @@ export const claimDueWork = async (
         JOIN conversations c ON c.id = t.conversation_id
         JOIN sandboxes s ON s.agent_id = c.agent_id
         WHERE s.runner_id = ${runnerId}
+          ${channelHeldBy(replicaId)}
           AND s.status = 'running'
+          AND s.stop_requested_at IS NULL
           AND (
             t.status = 'queued'
             OR (t.status = 'dispatched' AND t.updated_at < ${staleDispatch})
@@ -761,6 +946,55 @@ export const claimDueWork = async (
         -- the turn-budget sweeps measure from — a promoted follow-up or an
         -- auto-retried turn deliberately restarts it.
         COALESCE(t.retried_at, t.promoted_at, t.created_at) AS waited_since
+    `;
+
+    // SEND NOW: a waiting follow-up the person asked the run
+    // to read now. One-shot like the abort arm: the flag is cleared in the
+    // same statement that hands it over. Four predicates carry the design:
+    //
+    // - `steer_delivered_at IS NOT NULL` - the follow-up must already be IN
+    //   the run's queue, or there is nothing for moving the tool to let in.
+    //   A request made before delivery just waits here; the steer arm above
+    //   stamps delivery in this same transaction, so a follow-up claimed for
+    //   delivery in this poll is eligible here too, and the composition
+    //   below emits it AFTER its `turn.message` on the same ordered socket.
+    // - `f.status = 'joining'` - a row already read (`joined`), aborted or
+    //   promoted has nothing to wait for; its flag is simply never handed
+    //   over (and a promoted row's is inert: this arm is its only reader).
+    // - the target is RUNNING - a turn not started yet has no tool to move,
+    //   and a finished one is not reading anything.
+    // - the runner capability gate, for the same all-or-nothing parse
+    //   reason as the steer arm.
+    const sendNows = await tx.$queryRaw<SendNowRow[]>`
+      WITH claimed AS (
+        SELECT f.id
+        FROM turns f
+        JOIN turns target ON target.id = f.follow_up_of_turn_id
+        JOIN conversations c ON c.id = f.conversation_id
+        JOIN sandboxes s ON s.agent_id = c.agent_id
+        JOIN runners r ON r.id = s.runner_id
+        WHERE s.runner_id = ${runnerId}
+          ${channelHeldBy(replicaId)}
+          AND s.status = 'running'
+          AND f.send_now_requested = true
+          AND f.status = 'joining'
+          AND f.steer_delivered_at IS NOT NULL
+          AND target.status = 'running'
+          AND (r.capabilities->>'sendNow')::boolean IS TRUE
+        ORDER BY f.created_at ASC
+        LIMIT ${TURN_LIMIT}
+        FOR UPDATE OF f SKIP LOCKED
+      )
+      UPDATE turns f SET send_now_requested = false, updated_at = now()
+      FROM claimed cl
+      WHERE f.id = cl.id
+      RETURNING
+        f.id,
+        f.conversation_id,
+        f.follow_up_of_turn_id,
+        (SELECT s.id FROM conversations c
+           JOIN sandboxes s ON s.agent_id = c.agent_id
+          WHERE c.id = f.conversation_id) AS sandbox_id
     `;
 
     return [
@@ -804,6 +1038,7 @@ export const claimDueWork = async (
           generation: row.home_desired_generation,
         }),
       ),
+      ...desktopPushes,
       ...turns.flatMap((row): DueTurn[] =>
         row.sandbox_id && row.agent_id
           ? [
@@ -822,7 +1057,10 @@ export const claimDueWork = async (
       ),
       // Steers LAST, after the turn arm: within one composed batch the
       // runner executes serially, so a same-poll deliver+steer pair reaches
-      // the supervisor in deliver-first order.
+      // the supervisor in deliver-first order. A sender's words (a person,
+      // a peer agent) get the "new message" frame; an automation's follow-up
+      // (a wake joining a running watch turn) already says what it is in
+      // its own header.
       ...steers.flatMap((row): DueTurnMessage[] =>
         row.sandbox_id
           ? [
@@ -833,6 +1071,10 @@ export const claimDueWork = async (
                 conversationId: row.conversation_id,
                 sandboxId: row.sandbox_id,
                 message: row.message,
+                ...(!isAutomationSource(row.source) && {
+                  context: STEERED_FOLLOW_UP_CONTEXT,
+                }),
+                hasAttachments: row.has_attachments,
               },
             ]
           : [],
@@ -845,11 +1087,27 @@ export const claimDueWork = async (
           ? [
               {
                 kind: "turn.message",
-                turnId: `ceiling-warning:${row.id}`,
+                turnId: ceilingWarningSteerId(row.id),
                 targetTurnId: row.id,
                 conversationId: row.conversation_id,
                 sandboxId: row.sandbox_id,
                 message: TURN_CEILING_WARNING_MESSAGE,
+                hasAttachments: false,
+              },
+            ]
+          : [],
+      ),
+      // Send nows LAST of all: a follow-up delivered in this very poll must
+      // reach the supervisor before the request to read it now does.
+      ...sendNows.flatMap((row): DueTurnSendNow[] =>
+        row.sandbox_id
+          ? [
+              {
+                kind: "turn.send_now",
+                turnId: row.id,
+                targetTurnId: row.follow_up_of_turn_id,
+                conversationId: row.conversation_id,
+                sandboxId: row.sandbox_id,
               },
             ]
           : [],
@@ -1196,6 +1454,122 @@ export const completeClaimedCron = async (
   return count > 0;
 };
 
+// ── Eval schedules ───────────────────────────────────────────────────────────
+// The agent's eval schedule (eval-schedule-service.ts), claimed with the same
+// CTE + lease law as the crons above: claiming stamps `next_fire_at = lease`,
+// so concurrent pollers skip the row, and a poller that dies mid-fire only
+// delays that fire by the lease. Firing lives in eval-schedule-fire-service.
+
+/** Eval schedules fired per poll. A fire admits one run (a few writes) and
+ * the run itself proceeds in the background worker. */
+const EVAL_SCHEDULE_FIRE_LIMIT = 10;
+const EVAL_SCHEDULE_LEASE_SECONDS = 300;
+
+export interface DueEvalSchedule {
+  id: string;
+  agentId: string;
+  workspaceId: string;
+  organizationId: string;
+  schedule: string;
+  timezone: string;
+  createdByUserId: string | null;
+}
+
+interface DueEvalScheduleRow {
+  id: string;
+  agent_id: string;
+  workspace_id: string;
+  organization_id: string;
+  schedule: string;
+  timezone: string;
+  created_by_user_id: string | null;
+}
+
+export const claimDueEvalSchedules = async (): Promise<{
+  lease: Date;
+  schedules: DueEvalSchedule[];
+}> => {
+  const now = new Date();
+  const lease = new Date(Date.now() + EVAL_SCHEDULE_LEASE_SECONDS * 1000);
+  const rows = await db.$queryRaw<DueEvalScheduleRow[]>`
+    WITH claimed AS (
+      SELECT es.id
+      FROM agent_eval_schedules es
+      WHERE es.enabled = true
+        AND es.next_fire_at <= ${now}
+      ORDER BY es.next_fire_at ASC
+      LIMIT ${EVAL_SCHEDULE_FIRE_LIMIT}
+      FOR UPDATE OF es SKIP LOCKED
+    )
+    UPDATE agent_eval_schedules es
+    SET next_fire_at = ${lease}, updated_at = now()
+    FROM claimed cl, agents a, workspaces w
+    WHERE es.id = cl.id
+      AND a.id = es.agent_id
+      AND w.id = a.workspace_id
+    RETURNING
+      es.id,
+      es.agent_id,
+      a.workspace_id,
+      w.organization_id,
+      es.schedule,
+      es.timezone,
+      es.created_by_user_id
+  `;
+  return {
+    lease,
+    schedules: rows.map((row) => ({
+      id: row.id,
+      agentId: row.agent_id,
+      workspaceId: row.workspace_id,
+      organizationId: row.organization_id,
+      schedule: row.schedule,
+      timezone: row.timezone,
+      createdByUserId: row.created_by_user_id,
+    })),
+  };
+};
+
+/**
+ * Move a claimed eval schedule from its lease to the real next occurrence
+ * (or retire it when there is none), only if the lease is still ours. A
+ * human save mid-claim recomputed `next_fire_at`, and this fire is skipped.
+ */
+export const advanceClaimedEvalSchedule = async (
+  scheduleId: string,
+  expectedLease: Date,
+  nextFireAt: Date | null,
+): Promise<boolean> => {
+  const { count } = await db.agentEvalSchedule.updateMany({
+    where: { id: scheduleId, nextFireAt: expectedLease },
+    data: nextFireAt
+      ? { nextFireAt, lastFiredAt: new Date() }
+      : {
+          enabled: false,
+          disabledReason: "completed",
+          lastFiredAt: new Date(),
+        },
+  });
+  return count > 0;
+};
+
+/**
+ * Turn a claimed eval schedule off because its creator can no longer run it,
+ * only if the lease is still ours: a save mid-claim (often a colleague taking
+ * it over, which the paused message asks for) re-enabled it under a new
+ * creator, and that save wins.
+ */
+export const disableClaimedEvalSchedule = async (
+  scheduleId: string,
+  expectedLease: Date,
+): Promise<boolean> => {
+  const { count } = await db.agentEvalSchedule.updateMany({
+    where: { id: scheduleId, nextFireAt: expectedLease },
+    data: { enabled: false, disabledReason: "authorization" },
+  });
+  return count > 0;
+};
+
 // ── Background-process watches (step 10) ─────────────────────────────────────
 // The durable side of the watch model. The supervisor detects exit/pattern/
 // silence in memory and reports triggers; the control plane owns the outcomes
@@ -1212,15 +1586,30 @@ const WATCH_FIRE_LEASE_SECONDS = 300;
 
 /**
  * A running process whose sandbox is down, or whose container_ref no longer
- * matches the sandbox's current one, is LOST (step 10). Excludes `starting`
- * deliberately: a report race can briefly show a starting sandbox with the
- * old ref, and recreate-on-start always changes the ref, so the mismatch
- * term catches the real death on the next pass without a spurious hit.
+ * matches the sandbox's current one, is over (step 10). Its terminal state
+ * says WHY: `parked` when the control plane took the box down ON PURPOSE
+ * (the stop claim stamped `stop_reason`: an idle park, the background cap,
+ * a person's restart, a ceiling eviction) and the container is the one that
+ * claim took down; `lost` for every other death (a crash, a vanished
+ * container, a replaced one). The two differ downstream: a parked process's
+ * watch delivers a quiet notice; a lost one wakes the agent. A restart in
+ * particular MUST read parked: the person just said "stop everything", and
+ * a "lost" wake would start the agent working again seconds later
+ * (observed live: restart → lost wake → the agent inspecting the dead
+ * process it was told to drop). Excludes `starting` deliberately: a report
+ * race can briefly show a starting sandbox with the old ref, and
+ * recreate-on-start always changes the ref, so the mismatch term catches
+ * the real death on the next pass without a spurious hit.
  */
 export const sweepLostProcesses = async (): Promise<number> =>
   db.$executeRaw`
     UPDATE sandbox_processes p
-    SET status = 'lost', ended_at = now(), updated_at = now()
+    SET status = CASE
+          WHEN s.stop_reason IN ('idle', 'restart', 'evict')
+            AND s.status IN ('stopped', 'stopping')
+            AND p.container_ref = s.container_ref
+          THEN 'parked' ELSE 'lost' END,
+        ended_at = now(), updated_at = now()
     FROM sandboxes s
     WHERE p.sandbox_id = s.id
       AND p.status = 'running'
@@ -1232,21 +1621,24 @@ export const sweepLostProcesses = async (): Promise<number> =>
 
 /**
  * Any watch still `armed` on a process that has reached a terminal state is
- * converted to `triggered` — with `lost` when the process was lost, else
- * `exited`. This is the coherence net that closes the dropped-frame hole: if
- * the supervisor's own exit-trigger frame was lost, the watch would otherwise
- * sit armed on a corpse forever (and hold keep-awake until expiry).
+ * converted to `triggered` — with the process's own verdict (`lost`,
+ * `parked`) or `exited`. This is the coherence net that closes the
+ * dropped-frame hole: if the supervisor's own exit-trigger frame was lost,
+ * the watch would otherwise sit armed on a corpse forever (and hold
+ * keep-awake until expiry).
  */
 export const sweepWatchCoherence = async (): Promise<number> =>
   db.$executeRaw`
     UPDATE process_watches w
     SET status = 'triggered',
-        trigger = CASE WHEN p.status = 'lost' THEN 'lost' ELSE 'exited' END,
+        trigger = CASE
+          WHEN p.status IN ('lost', 'parked') THEN p.status
+          ELSE 'exited' END,
         triggered_at = now(), updated_at = now()
     FROM sandbox_processes p
     WHERE w.process_id = p.id
       AND w.status = 'armed'
-      AND p.status IN ('exited', 'stopped', 'lost')
+      AND p.status IN ('exited', 'stopped', 'lost', 'parked')
   `;
 
 /** Armed watches past their deadline expire — terminal, and NEVER a turn. */
@@ -1468,9 +1860,14 @@ const waiters = new Set<Waiter>();
 
 /**
  * Wake every held poll. Called wherever work becomes due out-of-band (a
- * hosted agent created, a token regenerated). In-process by design: v2 runs
- * one api instance per install, and a missed wake costs one re-check
- * interval, never a lost item — dueness is always recomputed from Postgres.
+ * hosted agent created, a token regenerated). In-process only: the wake
+ * reaches the polls held by THIS api instance, and a deployment may run
+ * several behind one balancer. A poll held by another instance finds the
+ * work on its next re-check (RECHECK_MS, a second), never loses it, because
+ * dueness is always recomputed from Postgres. What it does miss is a
+ * signal-only check: a retired runner copy's poll held by another instance
+ * answers at its deadline, not at once. A wake shared across instances
+ * (Postgres LISTEN/NOTIFY) would close both.
  */
 export const signalWork = (): void => {
   for (const waiter of [...waiters]) {
@@ -1547,12 +1944,13 @@ export const pendingWaiterCount = (): number => waiters.size;
 export const agentIdsWithLiveBackgroundWork = async (
   workspaceId: string,
 ): Promise<Set<string>> => {
+  const { idleBefore, capBefore } = keepAwakeClocks();
   const rows = await db.$queryRaw<Array<{ agent_id: string }>>`
     SELECT DISTINCT s.agent_id FROM sandboxes s
     JOIN agents a ON a.id = s.agent_id
     WHERE a.workspace_id = ${workspaceId}
       AND s.status = 'running'
-      AND ${keepAwakeExists()}
+      AND ${keepAwakeExists(idleBefore, capBefore)}
   `;
   return new Set(rows.map((row) => row.agent_id));
 };
@@ -1564,11 +1962,38 @@ export const agentIdsWithLiveBackgroundWork = async (
 export const heldAwakeCountsByRunner = async (): Promise<
   Map<string, number>
 > => {
+  const { idleBefore, capBefore } = keepAwakeClocks();
   const rows = await db.$queryRaw<Array<{ runner_id: string; held: number }>>`
     SELECT s.runner_id, count(*)::int AS held FROM sandboxes s
     WHERE s.status = 'running'
-      AND ${keepAwakeExists()}
+      AND ${keepAwakeExists(idleBefore, capBefore)}
     GROUP BY s.runner_id
   `;
   return new Map(rows.map((row) => [row.runner_id, row.held]));
+};
+
+/**
+ * What the hold is COSTING right now: the running sandboxes past their idle
+ * window that only keep-awake keeps up (the stop arm's exact complement),
+ * and how long the oldest has been held past it. The operator's view of
+ * that failure mode (idle work holding a box awake), logged by the poll
+ * sweep so a regression shows up as a number, not as a bill.
+ */
+export const heldIdleSummary = async (): Promise<{
+  held: number;
+  oldestHeldSeconds: number;
+}> => {
+  const { idleBefore, capBefore } = keepAwakeClocks();
+  const [row] = await db.$queryRaw<
+    [{ held: number; oldest_held_seconds: number | null }]
+  >`
+    SELECT count(*)::int AS held,
+           EXTRACT(EPOCH FROM ${idleBefore} - min(s.last_active_at))::int
+             AS oldest_held_seconds
+    FROM sandboxes s
+    WHERE s.status = 'running'
+      AND s.last_active_at < ${idleBefore}
+      AND ${keepAwakeExists(idleBefore, capBefore)}
+  `;
+  return { held: row.held, oldestHeldSeconds: row.oldest_held_seconds ?? 0 };
 };

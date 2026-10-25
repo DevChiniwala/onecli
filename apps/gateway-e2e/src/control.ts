@@ -20,12 +20,33 @@ export interface PendingApproval {
   /** The readable card (`summary::ApprovalSummary` on the wire). */
   readonly summary?: {
     readonly action: string;
-    readonly details: ReadonlyArray<{ label: string; value: string }>;
+    /** The familiar shape it produces (`email`, `event`); absent otherwise. */
+    readonly kind?: "email" | "event";
+    readonly details: ReadonlyArray<{
+      label: string;
+      value: string;
+      /** The record's page, gateway-built (https only); absent otherwise. */
+      url?: string;
+    }>;
     readonly subject?: {
       verb: string;
       lead: string;
       record: string;
       row: number;
+    };
+    /** A record table (Salesforce sObject Collections or Composite, or one
+     *  record). */
+    readonly bulk?: {
+      kind: "create" | "update" | "delete";
+      object: string;
+      objectLabel: string;
+      fields: ReadonlyArray<{ api: string; label: string }>;
+      rows: ReadonlyArray<{
+        id: string;
+        name?: string;
+        new: ReadonlyArray<string | null>;
+      }>;
+      hiddenFields?: ReadonlyArray<string>;
     };
   };
   /** The agent's batch tag (`X-OneCLI-Batch*`), when it sent one. */
@@ -41,9 +62,11 @@ const fetchPending = async (
   gw: GatewayHandle,
   apiKey: string,
   path: string,
+  signal?: AbortSignal,
 ): Promise<ReadonlyArray<PendingApproval>> => {
   const res = await fetch(`${gw.origin}${path}`, {
     headers: authHeaders(apiKey),
+    signal,
   });
   if (res.status !== 200) {
     throw new Error(`GET ${path} → ${String(res.status)}: ${await res.text()}`);
@@ -86,6 +109,44 @@ export const decideApproval = async (
 };
 
 /**
+ * Longest a single poll inside the wait helpers may hold. The endpoint
+ * long-polls up to 30 s on an empty queue, longer than the helpers' whole
+ * deadline, so one missed wakeup would otherwise fail the test outright.
+ * Abandoning a quiet poll after 2 s and re-polling bounds that cost to 2 s.
+ */
+const POLL_HOLD_MS = 2_000;
+
+const isPollTimeout = (err: unknown): boolean =>
+  err instanceof DOMException && err.name === "TimeoutError";
+
+/** Poll `path` until it lists an approval or `timeoutMs` elapses. */
+const waitForPending = async (
+  gw: GatewayHandle,
+  apiKey: string,
+  path: string,
+  timeoutMs: number,
+): Promise<PendingApproval | undefined> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const hold = Math.max(1, Math.min(POLL_HOLD_MS, deadline - Date.now()));
+    try {
+      const pending = await fetchPending(
+        gw,
+        apiKey,
+        path,
+        AbortSignal.timeout(hold),
+      );
+      if (pending[0] !== undefined) return pending[0];
+    } catch (err) {
+      if (!isPollTimeout(err)) throw err;
+      continue;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return undefined;
+};
+
+/**
  * Poll until an approval shows up.
  *
  * The endpoint long-polls internally, but a held request only registers once the
@@ -97,12 +158,13 @@ export const waitForApproval = async (
   apiKey: string,
   timeoutMs = 15_000,
 ): Promise<PendingApproval> => {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const pending = await pendingApprovals(gw, apiKey);
-    if (pending[0] !== undefined) return pending[0];
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  const found = await waitForPending(
+    gw,
+    apiKey,
+    "/v1/approvals/pending",
+    timeoutMs,
+  );
+  if (found !== undefined) return found;
   throw new Error(`no approval appeared within ${String(timeoutMs)}ms`);
 };
 
@@ -112,11 +174,12 @@ export const waitForOrgApproval = async (
   orgApiKey: string,
   timeoutMs = 15_000,
 ): Promise<PendingApproval> => {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const pending = await pendingOrgApprovals(gw, orgApiKey);
-    if (pending[0] !== undefined) return pending[0];
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  const found = await waitForPending(
+    gw,
+    orgApiKey,
+    "/v1/org/approvals/pending",
+    timeoutMs,
+  );
+  if (found !== undefined) return found;
   throw new Error(`no org approval appeared within ${String(timeoutMs)}ms`);
 };

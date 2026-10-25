@@ -33,8 +33,11 @@ const formatAction = (action: string, service: string) => {
       update: "Updated",
       delete: "Deleted",
       regenerate: "Regenerated",
+      restart: "Restarted",
       connect: "Connected",
       disconnect: "Disconnected",
+      view: "Viewed",
+      run: "Ran",
     }[action] ?? action;
 
   const noun =
@@ -47,6 +50,8 @@ const formatAction = (action: string, service: string) => {
       "app-config": "app config",
       deployment: "deployment",
       workspace: "workspace",
+      conversation: "private conversation",
+      eval: "eval",
     }[service] ?? service;
 
   return `${verb} ${noun}`;

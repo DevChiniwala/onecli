@@ -1,24 +1,29 @@
 "use client";
 
-import { LIFECYCLE_TURN_ERROR_CODES } from "@onecli/api/validations/conversation";
+import {
+  LIFECYCLE_TURN_ERROR_CODES,
+  TURN_FAILED_RAW_ERROR_MESSAGE,
+  isRawErrorPayload,
+} from "@onecli/api/validations/conversation";
 import { activityForTool } from "@onecli/agent-protocol/activity";
-import { Bubble, BubbleContent } from "@onecli/ui/components/bubble";
 import { Message, MessageContent } from "@onecli/ui/components/message";
 import type { Turn } from "@/lib/api/types";
 import type { RenderedTurn } from "@/lib/chat/transcript";
 import {
   isActiveTurn,
   isAutomationTurn,
+  isJoinedTurn,
   isJoiningTurn,
   isPlatformAuthoredTurn,
 } from "@/lib/chat/turns";
+import { AgentAnswer } from "./agent-answer";
 import { AutomationTurnHeader } from "./automation-turn";
 import { ActivityLine } from "./activity-line";
-import { ChatMarkdown } from "./chat-markdown";
-import { ConnectorSuggestions } from "./connect-suggestions";
+import { FollowUpExchange } from "./follow-up-exchange";
 import { GreetingConnectCard } from "./greeting-connect-card";
 import { NarrationText } from "./narration-text";
 import { AttachmentChips } from "./attachment-chips";
+import { originLabel } from "./origin-label";
 import { ToolGroup } from "./tool-group";
 import { TurnNotice } from "./turn-notice";
 import { UserBubble } from "./user-bubble";
@@ -35,15 +40,6 @@ const waitingCopy = (turn: Turn): string =>
   turn.status === "queued" || turn.status === "dispatched"
     ? "Waking the agent…"
     : "Thinking…";
-
-/** Named doors get a proper label; an unrecognized one still says where it
- *  came from rather than nothing. "web" is home — no chip. */
-const ORIGIN_LABELS: Record<string, string> = {
-  slack: "via Slack",
-  // A peer agent's words on the pair conversation (PR 5b); the bubble's
-  // text already names which agent, in its `Name (agent):` frame.
-  agent: "from another agent",
-};
 
 /** Turn.errorCode values that mean "a platform hiccup, not agent output" —
  *  rendered as the quiet TurnNotice, never the red failure box (the copy
@@ -67,29 +63,57 @@ const KEY_FIX_LABELS = new Map<string, string>([
   ["trial_credit_exhausted", "Add your own model key"],
 ]);
 
-const originLabel = (source: string): string | undefined =>
-  source === "web" ? undefined : (ORIGIN_LABELS[source] ?? `via ${source}`);
-
 export const TurnBlock = ({
   turn,
   rendered,
   followUps,
+  followUpRendered,
   modelsHref,
+  onOpenComputer,
+  computerHref,
   onConnectModelKey,
 }: {
   turn: Turn;
   rendered: RenderedTurn | undefined;
   /** Mid-run follow-ups riding THIS turn (`joining`/`joined`), oldest first.
-   *  Rendered between the user bubble and the agent block, so the answer
-   *  that covers them stays the LAST thing in the exchange. */
+   *  A JOINED one (the run has it) renders between the user bubble and the
+   *  agent block with the agent's reply to it, so the answer that covers
+   *  the rest stays the LAST thing in the exchange. A JOINING one (sent,
+   *  not yet read) renders BELOW the agent's live work: it is a message
+   *  the agent has not reached yet, so it sits after what the agent is
+   *  doing now, and moves up into the exchange the moment it is picked
+   *  up. */
   followUps?: Turn[];
+  /** What the transcript holds under each follow-up's own id: its reply,
+   *  streaming or stored. */
+  followUpRendered?: (followUpId: string) => RenderedTurn | undefined;
   /** Where "Connect a model key" goes; omitted outside the agent page. */
   modelsHref?: string;
+  /** Open the agent's screen IN PLACE for its "Needs you" desktop ask, over
+   *  the conversation with Take control in view. Preferred over the deep
+   *  link when present. */
+  onOpenComputer?: (requestId: string) => void;
+  /** Deep link fallback. Without either action the notice is plain text. */
+  computerHref?: (requestId: string) => string;
   /** Open the add-key dialog IN PLACE (preferred over the Models link when
    *  provided): the fix happens over the chat instead of leaving it. */
   onConnectModelKey?: () => void;
 }) => {
   const active = isActiveTurn(turn);
+  const joined = followUps?.filter(isJoinedTurn) ?? [];
+  const joining = followUps?.filter(isJoiningTurn) ?? [];
+  // SEND NOW has a run to act on only once the turn is
+  // RUNNING, and helps only while it is inside a tool (a step with no
+  // result yet). A message with files joins the live run like any other
+  // (the rare runner that cannot carry files there is refused by the API,
+  // and the click says so).
+  const toolRunning =
+    rendered?.tools.some((tool) => tool.output === undefined) === true &&
+    !rendered.ended;
+  const sendNowFor = (followUp: Turn) =>
+    turn.status === "running"
+      ? { toolRunning, outcome: followUpRendered?.(followUp.id)?.sentNow }
+      : undefined;
   // One turn, two speakers' files: what the person attached rides under
   // their bubble; what the agent sent back (send_file) rides under its
   // answer. Split on `direction` — an older API omits it, and every such
@@ -144,6 +168,11 @@ export const TurnBlock = ({
   // A lifecycle hiccup (restart, start failure, capacity): guidance too,
   // just with no action to attach — the sentence itself says what to do.
   const friendlyFailure = FRIENDLY_FAILURE_CODES.has(turn.errorCode ?? "");
+  // An uncoded failure whose text is a provider's raw response body, not a
+  // sentence: the reader gets the generic copy, and the raw text stays one
+  // click away for whoever is debugging. A readable sentence keeps the red
+  // line as written.
+  const rawPayload = Boolean(errorText && isRawErrorPayload(errorText));
 
   return (
     <>
@@ -168,19 +197,12 @@ export const TurnBlock = ({
         />
       )}
 
-      {followUps?.map((followUp) => (
-        <UserBubble
+      {joined.map((followUp) => (
+        <FollowUpExchange
           key={followUp.id}
-          text={followUp.message}
-          origin={originLabel(followUp.source)}
-          conversationId={followUp.conversationId}
-          attachments={followUp.attachments}
-          // Steering into the live run: received, being folded into the
-          // answer below. The hint drops once the run consumes it (`joined`)
-          // — the quiet mark's whole lifetime is the in-between.
-          {...(isJoiningTurn(followUp) && {
-            hint: "Received, folding it in",
-          })}
+          followUp={followUp}
+          rendered={followUpRendered?.(followUp.id)}
+          targetActive={active}
         />
       ))}
 
@@ -229,27 +251,7 @@ export const TurnBlock = ({
                 )}
                 {rendered?.text ? (
                   <>
-                    {/* The promotion moment: the transient log unmounts and
-                        the answer fades in over it — motion says "this is
-                        the keeper", and reduced-motion readers just see the
-                        swap. */}
-                    <Bubble
-                      variant="ghost"
-                      className="motion-safe:animate-in motion-safe:fade-in motion-safe:duration-300"
-                    >
-                      <BubbleContent>
-                        <ChatMarkdown
-                          text={rendered.text}
-                          suppressConnectLinks
-                        />
-                      </BubbleContent>
-                    </Bubble>
-                    {/* Connect links in the answer render as the card below
-                        it — icon + description + Connect — instead of prose
-                        links (suppressed above): one unmissable call to
-                        action. Reads the ANSWER only — never the streamed
-                        narration, which is untrusted progress text. */}
-                    <ConnectorSuggestions text={rendered.text} />
+                    <AgentAnswer text={rendered.text} />
                     {/* Under the agent's greeting, the first-connection
                         picks it just named — the same card a connect link
                         would render, one click each. Only on a finished
@@ -284,9 +286,29 @@ export const TurnBlock = ({
                 />
               </div>
             )}
-            {rendered?.notices.map((notice, index) => (
-              <TurnNotice key={`${index}-${notice}`} message={notice} />
-            ))}
+            {rendered?.notices.map((notice, index) => {
+              // The agent's open ask for a person on its screen: the one
+              // notice with somewhere to go. Settled asks are plain lines.
+              const ask = rendered.desktopRequests.get(index);
+              const open =
+                ask?.outcome === "pending"
+                  ? onOpenComputer
+                    ? {
+                        onClick: () => onOpenComputer(ask.id),
+                        label: "Open computer",
+                      }
+                    : computerHref
+                      ? { href: computerHref(ask.id), label: "Open computer" }
+                      : undefined
+                  : undefined;
+              return (
+                <TurnNotice
+                  key={`${index}-${notice}`}
+                  message={notice}
+                  action={open}
+                />
+              );
+            })}
             {errorText &&
               (keyFixLabel ? (
                 <TurnNotice
@@ -306,6 +328,11 @@ export const TurnBlock = ({
                 />
               ) : friendlyFailure ? (
                 <TurnNotice message={errorText} />
+              ) : rawPayload ? (
+                <TurnNotice
+                  message={TURN_FAILED_RAW_ERROR_MESSAGE}
+                  details={errorText}
+                />
               ) : (
                 <p className="bg-destructive/10 text-destructive rounded-md px-3 py-2 text-xs">
                   {errorText}
@@ -317,6 +344,19 @@ export const TurnBlock = ({
           </MessageContent>
         </Message>
       )}
+
+      {/* Sent while the agent worked, not read yet: below the live work,
+          where a message the agent has not reached belongs. Nothing under
+          it until the run picks it up and it moves into the exchange, but
+          its status line may offer SEND NOW (and then say what happened,
+          the answer folded under its own id). */}
+      {joining.map((followUp) => (
+        <FollowUpExchange
+          key={followUp.id}
+          followUp={followUp}
+          sendNow={sendNowFor(followUp)}
+        />
+      ))}
     </>
   );
 };

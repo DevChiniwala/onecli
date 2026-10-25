@@ -17,6 +17,7 @@ import {
   updateAgent,
   deleteAgent,
   regenerateAgentToken,
+  restartAgent,
 } from "../services/agent-service";
 import {
   createAgentSchema,
@@ -102,7 +103,7 @@ export const agentRoutes = () => {
         harness: parsed.data.harness,
         instructions: parsed.data.instructions,
       },
-      // The grantor recorded on every grant the service auto-attaches.
+      // The grantor recorded on an auto-attached LLM key grant.
       auth.userId,
     );
     invalidateGatewayCache(c.req.raw);
@@ -289,16 +290,47 @@ export const agentRoutes = () => {
     return c.body(null, 204);
   });
 
-  // POST /agents/:agentId/regenerate-token
+  // POST /agents/:agentId/regenerate-token: rotates the agent's proxy token.
+  // Audited: it is a credential lifecycle event, and since the dashboard
+  // button was removed this route (CLI/API) is its only door.
   app.post("/:agentId/regenerate-token", async (c) => {
     const auth = c.get("auth");
+    const workspaceId = requireWorkspaceId(auth);
     const agentId = c.req.param("agentId");
-    const result = await regenerateAgentToken(
-      requireWorkspaceId(auth),
-      agentId,
-    );
+    const result = await regenerateAgentToken(workspaceId, agentId);
+    await recordAuditEvent({
+      workspaceId,
+      userId: auth.userId,
+      userEmail: auth.userEmail,
+      action: AUDIT_ACTIONS.REGENERATE,
+      service: AUDIT_SERVICES.AGENT,
+      source: AUDIT_SOURCE.API,
+      metadata: { agentId },
+    });
     invalidateGatewayCache(c.req.raw);
     return c.json(result);
+  });
+
+  // POST /agents/:agentId/restart: "Restart agent". Every conversation of
+  // this hosted agent starts fresh and its sandbox stops, so the next message
+  // cold-starts it. Audited (the agent-image pattern): it ends work in
+  // flight, and this route is its only door. No gateway cache flush: the
+  // gateway reads none of what it changes.
+  app.post("/:agentId/restart", async (c) => {
+    const auth = c.get("auth");
+    const workspaceId = requireWorkspaceId(auth);
+    const agentId = c.req.param("agentId");
+    await restartAgent(workspaceId, agentId);
+    await recordAuditEvent({
+      workspaceId,
+      userId: auth.userId,
+      userEmail: auth.userEmail,
+      action: AUDIT_ACTIONS.RESTART,
+      service: AUDIT_SERVICES.AGENT,
+      source: AUDIT_SOURCE.API,
+      metadata: { agentId },
+    });
+    return c.json({ success: true });
   });
 
   // POST /agents/:agentId/ssh-certificate: mint a

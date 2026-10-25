@@ -58,6 +58,7 @@ describe("supervisor loop end-to-end (fake harness, stdio transport)", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       createFakeHarness(),
@@ -140,6 +141,7 @@ describe("supervisor loop end-to-end (fake harness, stdio transport)", () => {
           harness: "fake",
           runnerWsUrl: undefined,
           bootstrapToken: undefined,
+          sandboxId: undefined,
           outboundAttachments: false,
         },
         createFakeHarness(),
@@ -206,6 +208,61 @@ describe("supervisor loop end-to-end (fake harness, stdio transport)", () => {
     );
   });
 
+  it("previews arrive together and only from a runner that carries port streams: the fragment and preview_expose, or neither", async () => {
+    // Never teach a tool the agent does not have: a runner without a port
+    // API (self-host, previews dark) must yield no fragment and no tool.
+    // MUTATION-PROOF: make either side unconditional and one half fails.
+    const boot = async (previews: boolean | undefined) => {
+      const homeDir = mkdtempSync(join(tmpdir(), "supervisor-previews-"));
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const run = runSupervisor(
+        {
+          homeDir,
+          model: undefined,
+          effort: undefined,
+          instructions: undefined,
+          agentName: "Ada",
+          channels: [],
+          peers: [],
+          connections: [],
+          harness: "fake",
+          runnerWsUrl: undefined,
+          bootstrapToken: undefined,
+          sandboxId: undefined,
+          outboundAttachments: false,
+          previews,
+        },
+        createFakeHarness(),
+        createStdioTransport(input, output),
+      );
+      await new Promise<void>((resolve) => {
+        const onData = () => {
+          if (output.read()?.toString().includes('"kind":"ready"')) {
+            output.off("readable", onData);
+            resolve();
+          }
+        };
+        output.on("readable", onData);
+      });
+      const tools = await advertisedTools();
+      input.write('{"kind":"shutdown"}\n');
+      input.end();
+      await run;
+      const doc = readFileSync(join(homeDir, "CLAUDE.md"), "utf8");
+      return { tools, doc };
+    };
+
+    const on = await boot(true);
+    expect(on.tools).toContain("preview_expose");
+    expect(on.doc).toContain("Showing a running app to a person (previews)");
+
+    for (const off of [await boot(false), await boot(undefined)]) {
+      expect(off.tools).not.toContain("preview_expose");
+      expect(off.doc).not.toContain("preview_expose");
+    }
+  });
+
   it("a presence attached MID-RUN reaches the live conversation: the next turn restarts its session on the same ref and the bridge advertises the messaging tools", async () => {
     // The dev incident (2026-09-15): an agent whose session was already
     // awake had Slack attached; the home sync re-rendered CLAUDE.md on disk,
@@ -235,6 +292,7 @@ describe("supervisor loop end-to-end (fake harness, stdio transport)", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       fake,
@@ -448,6 +506,7 @@ describe("supervisor loop end-to-end (fake harness, stdio transport)", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       fake,
@@ -554,6 +613,7 @@ describe("supervisor loop end-to-end (fake harness, stdio transport)", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       fake,
@@ -657,6 +717,7 @@ describe("supervisor loop end-to-end (fake harness, stdio transport)", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       // The fake's default script echoes the prompt it was handed, so the
@@ -723,6 +784,7 @@ describe("home sync in the loop", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       createFakeHarness(),
@@ -807,6 +869,7 @@ describe("home sync in the loop", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       // A slow fake turn gives the abort something real to stop.
@@ -894,6 +957,7 @@ describe("home sync in the loop", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       wrapped,
@@ -1005,6 +1069,7 @@ describe("home sync in the loop", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       wrapped,
@@ -1078,6 +1143,7 @@ describe("home sync in the loop", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       createFakeHarness(),
@@ -1142,6 +1208,7 @@ describe("home sync in the loop", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       createFakeHarness(),
@@ -1224,6 +1291,7 @@ describe("the harvester is wired into the sync apply", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       createFakeHarness(),
@@ -1294,6 +1362,7 @@ describe("the answer is the agent's last message, not its whole turn", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       createFakeHarness({ script }),
@@ -1345,48 +1414,6 @@ describe("the answer is the agent's last message, not its whole turn", () => {
     expect(deltas).toContain("Now the config.");
   });
 
-  it("joins deltas within one message, so a streamed sentence stays whole", async () => {
-    // Segmentation is per MESSAGE, not per delta: token-by-token streaming
-    // inside one message must still concatenate.
-    const messages = await runWithScript(() => [
-      { type: "tool.started", callId: "c1", name: "bash" },
-      { type: "tool.finished", callId: "c1", name: "bash", output: "ok" },
-      { type: "text.delta", text: "All " },
-      { type: "text.delta", text: "four " },
-      { type: "text.delta", text: "gates are green." },
-      { type: "turn.done", usage: { inputTokens: 1, outputTokens: 1 } },
-    ]);
-
-    expect(answerOf(messages)).toBe("All four gates are green.");
-  });
-
-  it("falls back to the last thing said when a turn ends mid-tool", async () => {
-    // Never silent: a turn that stopped while working still said something,
-    // and posting nothing reads as the agent ignoring the person.
-    const messages = await runWithScript(() => [
-      { type: "text.delta", text: "Starting the deploy." },
-      { type: "tool.started", callId: "c1", name: "bash" },
-      { type: "error", message: "the harness died" },
-    ]);
-
-    expect(answerOf(messages)).toBe("Starting the deploy.");
-  });
-
-  it("does not let back-to-back tools erase the last words said", async () => {
-    // An empty segment must never displace a real one — otherwise a trailing
-    // pair of tool calls would blank the fallback and the turn goes silent.
-    const messages = await runWithScript(() => [
-      { type: "text.delta", text: "Found the cause." },
-      { type: "tool.started", callId: "c1", name: "bash" },
-      { type: "tool.finished", callId: "c1", name: "bash", output: "ok" },
-      { type: "tool.started", callId: "c2", name: "bash" },
-      { type: "tool.finished", callId: "c2", name: "bash", output: "ok" },
-      { type: "error", message: "stopped" },
-    ]);
-
-    expect(answerOf(messages)).toBe("Found the cause.");
-  });
-
   it("stays silent when the agent never said anything", async () => {
     const messages = await runWithScript(() => [
       { type: "tool.started", callId: "c1", name: "bash" },
@@ -1395,6 +1422,56 @@ describe("the answer is the agent's last message, not its whole turn", () => {
     ]);
 
     expect(answerOf(messages)).toBeNull();
+  });
+
+  /**
+   * FRAMED harnesses name each message. These run the supervisor end to end
+   * (the unit rules live in answer.test.ts): the stored answer honors the
+   * framing, and the framing itself never leaves the supervisor.
+   */
+  it("keeps framed messages with no tool between them as paragraphs, not glued", async () => {
+    // The steer shape: a closing answer, then the reply to a message
+    // the user sent mid-turn, written back to back.
+    const messages = await runWithScript(() => [
+      { type: "tool.started", callId: "c1", name: "bash" },
+      { type: "tool.finished", callId: "c1", name: "bash", output: "ok" },
+      {
+        type: "text.delta",
+        text: "Done: the report is in report.md.",
+        messageId: "m1",
+      },
+      {
+        type: "text.delta",
+        text: "Yes, I can also email it.",
+        messageId: "m2",
+      },
+      { type: "turn.done", usage: { inputTokens: 1, outputTokens: 1 } },
+    ]);
+
+    expect(answerOf(messages)).toBe(
+      "Done: the report is in report.md.\n\nYes, I can also email it.",
+    );
+  });
+
+  it("stores the replayed answer alone when the harness retracted a failed attempt", async () => {
+    const messages = await runWithScript(() => [
+      { type: "text.delta", text: "PARTIAL attempt text ", messageId: "m1" },
+      { type: "text.replace", messageId: "m1", text: "" },
+      { type: "text.delta", text: "THE-FINAL-ANSWER", messageId: "m2" },
+      { type: "turn.done", usage: { inputTokens: 1, outputTokens: 1 } },
+    ]);
+
+    expect(answerOf(messages)).toBe("THE-FINAL-ANSWER");
+    // Framing stops at the supervisor: the live tail still saw the deltas,
+    // in the wire vocabulary, and no correction or message id went out.
+    const events = messages.flatMap((m) =>
+      m.kind === "event" ? [m.event] : [],
+    );
+    expect(events.map((e) => e.type)).not.toContain("text.replace");
+    expect(events.filter((e) => e.type === "text.delta")).toEqual([
+      { type: "text.delta", text: "PARTIAL attempt text " },
+      { type: "text.delta", text: "THE-FINAL-ANSWER" },
+    ]);
   });
 });
 
@@ -1428,6 +1505,7 @@ describe("a first turn waits for the harness to take the tool list", () => {
         harness: "fake",
         runnerWsUrl: undefined,
         bootstrapToken: undefined,
+        sandboxId: undefined,
         outboundAttachments: false,
       },
       // Declares the bridge, so the supervisor must hold the first turn.
